@@ -858,6 +858,8 @@ class ListScannerApp(ctk.CTk):
                     locked_count += 1
                     item["status"] = "found"
                     item["additive_count"] = max(4, item.get("additive_count", 0))
+                    # Keep the green lock state, but clear stale display boxes.
+                    item["last_boxes"] = []
                     self._update_row_additive(i, item["additive_count"], True)
                     continue
 
@@ -867,16 +869,8 @@ class ListScannerApp(ctk.CTk):
                 item["additive_locked"] = False
                 self._update_row_additive(i, 0, False)
 
-            locked_boxes = [
-                b
-                for item in self._items
-                if item.get("additive_locked", False)
-                for b in item.get("last_boxes", [])
-            ]
-            if self._show_overlay and locked_boxes and self._scan_area:
-                self._overlay.show(self._scan_area, locked_boxes)
-            else:
-                self._overlay.hide()
+            # Always clear display boxes on reset, even for locked entries.
+            self._overlay.hide()
 
             self._debug_event(
                 f"Votes reset; generation={self._scan_gen}; additive_locked_preserved={locked_count}",
