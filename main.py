@@ -335,13 +335,28 @@ class ListScannerApp(ctk.CTk):
             border_width=0,
             font=ctk.CTkFont(size=18),
         )
+        self._additive_btn = ctk.CTkButton(
+            header,
+            text="+",
+            command=self._toggle_additive_mode,
+            fg_color="transparent",
+            hover_color=("gray82", "gray22"),
+            text_color=("gray45", "gray62"),
+            width=28,
+            height=28,
+            corner_radius=14,
+            border_width=0,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
         self._mode_lbl = ctk.CTkLabel(
             header, text="",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#ff9900",
         )
         self._mode_lbl.grid(row=0, column=1, sticky="e", padx=(0, 4))
-        self._config_btn.grid(row=0, column=2, sticky="e")
+        self._additive_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
+        self._config_btn.grid(row=0, column=3, sticky="e")
+        self._update_additive_indicator()
 
         # ── Combined input / results textbox ──
         box_card = ctk.CTkFrame(self)
@@ -622,8 +637,22 @@ class ListScannerApp(ctk.CTk):
         )
 
     def _update_additive_indicator(self):
-        """Show/hide the ADDITIVE label in the header."""
-        self._mode_lbl.configure(text="\u2295 ADDITIVE" if self._additive_mode else "")
+        """Show/hide additive label and sync header + button styling."""
+        is_on = self._additive_mode
+        self._mode_lbl.configure(text="additive" if is_on else "")
+        if hasattr(self, "_additive_btn"):
+            if is_on:
+                self._additive_btn.configure(
+                    fg_color="#ff9900",
+                    hover_color="#ffad33",
+                    text_color="#1a1a1a",
+                )
+            else:
+                self._additive_btn.configure(
+                    fg_color="transparent",
+                    hover_color=("gray82", "gray22"),
+                    text_color=("gray45", "gray62"),
+                )
 
     def _update_row_additive(self, idx: int, count: int, locked: bool):
         """Update a single item row: appends stars (1-3) or shows green at 4."""
