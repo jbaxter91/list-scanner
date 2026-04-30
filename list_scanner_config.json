@@ -12,7 +12,8 @@
     "set_area": "f10",
     "click_found": "f8"
   },
-  "ocr_scale": 1.1,
+  "ocr_scale": 1.3,
   "ctrl_click": true,
-  "always_on_top": true
+  "always_on_top": true,
+  "ocr_tile_max": 20
 }

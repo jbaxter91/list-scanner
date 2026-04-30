@@ -12,10 +12,12 @@ import sys
 import ctypes
 import ctypes.wintypes
 import json
+import math
 import threading
 import time
 import tkinter as tk
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -234,6 +236,10 @@ class ListScannerApp(ctk.CTk):
     _SCAN_INTERVAL = 0.75  # seconds between OCR passes
     _WINDOW_SIZE   = 4     # rolling window of recent scans for majority vote
     _HIDE_HIGHLIGHT_WIDTH = 520
+    _OCR_TILE_TARGET_PX = 500
+    _OCR_TILE_MIN_PX = 250
+    _OCR_TILE_OVERLAP_PX = 30
+    _OCR_TILE_MAX = 16
 
     def __init__(self):
         super().__init__()
@@ -256,6 +262,8 @@ class ListScannerApp(ctk.CTk):
         self._always_on_top = False         # keep window above all others
         self._highlight_control_visible = True
         self._show_debug_screenshot = False
+        self._show_debug_ocr_frames = False
+        self._ocr_tile_max = self._OCR_TILE_MAX  # user-configurable, persisted to config
 
         # Persistent config file next to the exe / script
         _base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
@@ -454,6 +462,8 @@ class ListScannerApp(ctk.CTk):
             if "always_on_top" in data:
                 self._always_on_top = bool(data["always_on_top"])
                 self._sync_window_stack()
+            if "ocr_tile_max" in data:
+                self._ocr_tile_max = max(1, int(data["ocr_tile_max"]))
             self._refresh_start_button()
         except Exception:
             pass
@@ -499,6 +509,7 @@ class ListScannerApp(ctk.CTk):
                 "ocr_scale": self._ocr_scale,
                 "ctrl_click": self._ctrl_click,
                 "always_on_top": self._always_on_top,
+                "ocr_tile_max": self._ocr_tile_max,
             }
             self._config_path.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -673,7 +684,26 @@ class ListScannerApp(ctk.CTk):
             bg="#1a1a1a", fg="#cccccc", selectcolor="#2b2b2b",
             activebackground="#1a1a1a", activeforeground="#ffffff",
             font=("Segoe UI", 11),
-        ).grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        ).grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 4), sticky="w")
+        btn_row += 1
+
+        # Max OCR frames spinbox
+        max_tile_row = tk.Frame(win, bg="#1a1a1a")
+        max_tile_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            max_tile_row, text="Max OCR frames:", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        max_tile_var = tk.IntVar(value=self._ocr_tile_max)
+        tk.Spinbox(
+            max_tile_row, from_=1, to=64, textvariable=max_tile_var, width=4,
+            bg="#2b2b2b", fg="#ffffff", insertbackground="white", relief="flat",
+            buttonbackground="#333333", font=("Consolas", 11),
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            max_tile_row, text="(1 = no subdivision)", bg="#1a1a1a", fg="#555555",
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(8, 0))
         btn_row += 1
 
         def save():
@@ -683,6 +713,7 @@ class ListScannerApp(ctk.CTk):
                     self._hotkeys[action] = val
             self._ctrl_click = ctrl_var.get()
             self._always_on_top = on_top_var.get()
+            self._ocr_tile_max = max(1, max_tile_var.get())
             self._sync_window_stack()
             self._apply_hotkeys()
             self._refresh_start_button()
@@ -810,6 +841,27 @@ class ListScannerApp(ctk.CTk):
         )
         self._debug_img_label.pack(fill="x", padx=10)
 
+        def toggle_ocr_frames():
+            self._show_debug_ocr_frames = bool(self._debug_ocr_frames_var.get())
+            self._debug_event(
+                f"OCR frame overlay {'enabled' if self._show_debug_ocr_frames else 'disabled'}",
+                "info",
+            )
+
+        self._debug_ocr_frames_var = tk.BooleanVar(value=self._show_debug_ocr_frames)
+        tk.Checkbutton(
+            win,
+            text="Show OCR frames",
+            variable=self._debug_ocr_frames_var,
+            command=toggle_ocr_frames,
+            bg="#1a1a1a",
+            fg="#cccccc",
+            selectcolor="#2b2b2b",
+            activebackground="#1a1a1a",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 11),
+        ).pack(anchor="w", padx=10, pady=(2, 6))
+
         style = ttk.Style(win)
         try:
             style.theme_use("clam")
@@ -894,16 +946,24 @@ class ListScannerApp(ctk.CTk):
         except Exception:
             import traceback; traceback.print_exc()
 
-    def _debug_update_image(self, img: Image.Image):
-        """Show a thumbnail of img in the debug panel."""
+    def _debug_update_image(self, img: Image.Image, tiles: list[dict] | None = None):
+        """Show a thumbnail of img in the debug panel, optionally overlaying OCR tile frames."""
         try:
             if not (hasattr(self, "_debug_win") and self._debug_win and self._debug_win.winfo_exists()):
                 return
             if not self._show_debug_screenshot:
                 return
-            from PIL import ImageTk
+            from PIL import ImageTk, ImageDraw
             MAX_W, MAX_H = 500, 220
-            thumb = img.copy()
+            thumb = img.copy().convert("RGB")
+            if self._show_debug_ocr_frames and tiles and len(tiles) > 1:
+                draw = ImageDraw.Draw(thumb)
+                for tile in tiles:
+                    x0 = tile["left"]
+                    y0 = tile["top"]
+                    x1 = x0 + tile["width"] - 1
+                    y1 = y0 + tile["height"] - 1
+                    draw.rectangle([x0, y0, x1, y1], outline=(255, 140, 0), width=2)
             thumb.thumbnail((MAX_W, MAX_H), Image.BILINEAR)
             padded = Image.new("RGB", (max(thumb.width, 1), MAX_H), (26, 26, 26))
             padded.paste(thumb, (0, (MAX_H - thumb.height) // 2))
@@ -1004,6 +1064,8 @@ class ListScannerApp(ctk.CTk):
             f"Scanning started: items={len(self._items)}, area={area['width']}x{area['height']} "
             f"at ({area['left']},{area['top']}), scale={self._ocr_scale:.1f}x, "
             f"ocr_mode={'digits-only' if self._ocr_digits_only else 'general'}, lang=eng, "
+            f"adaptive_tiles=target{self._OCR_TILE_TARGET_PX}px/min{self._OCR_TILE_MIN_PX}px/"
+            f"overlap{self._OCR_TILE_OVERLAP_PX}px/max{self._OCR_TILE_MAX}, "
             f"overlay={'on' if self._show_overlay else 'off'}, screenshot_preview="
             f"{'on' if self._show_debug_screenshot else 'off'}",
             "info",
@@ -1028,6 +1090,8 @@ class ListScannerApp(ctk.CTk):
         _cached_prepared_ocr: dict | None = None
         _cached_words: list[str] = []
         _cached_ocr_ms: float = 0.0
+        _cached_tile_desc: str = "1x1 (1 tile)"
+        _cached_tiles: list[dict] = []
         while self._scanning:
             try:
                 pass_start = time.perf_counter()
@@ -1090,6 +1154,8 @@ class ListScannerApp(ctk.CTk):
                     prepared_ocr = _cached_prepared_ocr
                     words = _cached_words
                     ocr_ms = 0.0
+                    tile_desc = _cached_tile_desc
+                    tiles = _cached_tiles
                     self.after(0, self._debug_event,
                                f"Scan {scan_id}: frame unchanged — reusing cached OCR (saved {_cached_ocr_ms:.0f}ms)",
                                "info")
@@ -1100,12 +1166,45 @@ class ListScannerApp(ctk.CTk):
                     ocr_config = "--oem 1 --psm 11"
                     if self._ocr_digits_only:
                         ocr_config += " -c tessedit_char_whitelist=0123456789"
-                    ocr = pytesseract.image_to_data(
-                        img,
-                        output_type=pytesseract.Output.DICT,
-                        lang="eng",
-                        config=ocr_config,
+                    cols, rows, tiles = self._build_adaptive_tiles(
+                        width=w,
+                        height=h,
+                        target_px=self._OCR_TILE_TARGET_PX,
+                        min_tile_px=self._OCR_TILE_MIN_PX,
+                        overlap_px=self._OCR_TILE_OVERLAP_PX,
+                        max_tiles=self._effective_tile_max(),
                     )
+                    tile_desc = f"{cols}x{rows} ({len(tiles)} tile{'s' if len(tiles) != 1 else ''})"
+
+                    if len(tiles) == 1:
+                        ocr = pytesseract.image_to_data(
+                            img,
+                            output_type=pytesseract.Output.DICT,
+                            lang="eng",
+                            config=ocr_config,
+                        )
+                    else:
+                        jobs: list[tuple[dict, Image.Image]] = []
+                        for tile in tiles:
+                            left = tile["left"]
+                            top = tile["top"]
+                            right = left + tile["width"]
+                            bottom = top + tile["height"]
+                            jobs.append((tile, gray.crop((left, top, right, bottom))))
+
+                        worker_count = min(len(jobs), self._effective_tile_max())
+                        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+                            parts = list(
+                                ex.map(
+                                    lambda job: self._ocr_tile(job, _SCALE, ocr_config),
+                                    jobs,
+                                )
+                            )
+                        ocr = _empty_ocr_result()
+                        for part in parts:
+                            for k in ("text", "conf", "left", "top", "width", "height"):
+                                ocr[k].extend(part[k])
+
                     ocr_ms = (time.perf_counter() - ocr_start) * 1000
                     prepared_ocr = _prepare_ocr_index(ocr, _SCALE)
                     words = [
@@ -1117,10 +1216,12 @@ class ListScannerApp(ctk.CTk):
                     _cached_prepared_ocr = prepared_ocr
                     _cached_words = words
                     _cached_ocr_ms = ocr_ms
+                    _cached_tile_desc = tile_desc
+                    _cached_tiles = tiles
 
                 # Push screenshot to debug panel
                 if self._show_debug_screenshot:
-                    self.after(0, self._debug_update_image, orig_img)
+                    self.after(0, self._debug_update_image, orig_img, tiles)
 
                 all_boxes: list[tuple] = []
                 found_count = 0
@@ -1174,7 +1275,7 @@ class ListScannerApp(ctk.CTk):
                     0,
                     self._debug_event,
                     f"Scan {scan_id} complete: found={found_count}/{total}, overlay_boxes={len(all_boxes)}, "
-                    f"ocr_words={len(words)}, capture={grab_ms:.0f}ms, ocr={ocr_ms:.0f}ms, total={elapsed_ms:.0f}ms, "
+                    f"ocr_words={len(words)}, tiles={tile_desc}, capture={grab_ms:.0f}ms, ocr={ocr_ms:.0f}ms, total={elapsed_ms:.0f}ms, "
                     f"status_changes={len(changed_statuses)}",
                     "info",
                 )
@@ -1195,6 +1296,88 @@ class ListScannerApp(ctk.CTk):
 
     def _set_status(self, msg: str):
         self._status_lbl.configure(text=msg)
+
+    def _effective_tile_max(self) -> int:
+        cpu = os.cpu_count() or 4
+        return max(1, min(self._ocr_tile_max, cpu * 2))
+
+    def _build_adaptive_tiles(
+        self,
+        width: int,
+        height: int,
+        target_px: int,
+        min_tile_px: int,
+        overlap_px: int,
+        max_tiles: int,
+    ) -> tuple[int, int, list[dict]]:
+        step = max(1, target_px - overlap_px)
+        cols = max(1, math.ceil(max(1, width - overlap_px) / step))
+        rows = max(1, math.ceil(max(1, height - overlap_px) / step))
+
+        while cols > 1 and (width / cols) < min_tile_px:
+            cols -= 1
+        while rows > 1 and (height / rows) < min_tile_px:
+            rows -= 1
+
+        while rows * cols > max_tiles:
+            if cols >= rows and cols > 1:
+                cols -= 1
+            elif rows > 1:
+                rows -= 1
+            else:
+                break
+
+        base_w = (width + cols - 1) // cols
+        base_h = (height + rows - 1) // rows
+        overlap = max(0, overlap_px)
+
+        tiles: list[dict] = []
+        for r in range(rows):
+            for c in range(cols):
+                x0 = c * base_w
+                y0 = r * base_h
+                x1 = min(width, (c + 1) * base_w)
+                y1 = min(height, (r + 1) * base_h)
+
+                tx0 = max(0, x0 - overlap)
+                ty0 = max(0, y0 - overlap)
+                tx1 = min(width, x1 + overlap)
+                ty1 = min(height, y1 + overlap)
+
+                tiles.append(
+                    {
+                        "left": tx0,
+                        "top": ty0,
+                        "width": tx1 - tx0,
+                        "height": ty1 - ty0,
+                    }
+                )
+
+        return cols, rows, tiles
+
+    def _ocr_tile(self, job: tuple[dict, Image.Image], scale: float, ocr_config: str) -> dict:
+        tile, crop = job
+        tw, th = crop.size
+        resized = crop.resize((int(tw * scale), int(th * scale)), Image.BILINEAR)
+        ocr = pytesseract.image_to_data(
+            resized,
+            output_type=pytesseract.Output.DICT,
+            lang="eng",
+            config=ocr_config,
+        )
+
+        offset_x = int(tile["left"] * scale)
+        offset_y = int(tile["top"] * scale)
+        merged = _empty_ocr_result()
+        n = len(ocr.get("text", []))
+        for i in range(n):
+            merged["text"].append(ocr["text"][i])
+            merged["conf"].append(ocr["conf"][i])
+            merged["left"].append(int(ocr["left"][i]) + offset_x)
+            merged["top"].append(int(ocr["top"][i]) + offset_y)
+            merged["width"].append(int(ocr["width"][i]))
+            merged["height"].append(int(ocr["height"][i]))
+        return merged
 
     def _close_debug_win(self):
         """Close the debug window and reset tracking state."""
@@ -1249,6 +1432,17 @@ class ListScannerApp(ctk.CTk):
 # =============================================================================
 
 import re as _re
+
+
+def _empty_ocr_result() -> dict:
+    return {
+        "text": [],
+        "conf": [],
+        "left": [],
+        "top": [],
+        "width": [],
+        "height": [],
+    }
 
 
 def _prepare_ocr_index(data: dict, scale: int = 1) -> dict:
