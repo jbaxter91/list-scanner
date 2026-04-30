@@ -264,6 +264,7 @@ class ListScannerApp(ctk.CTk):
         self._show_debug_screenshot = False
         self._show_debug_ocr_frames = False
         self._ocr_tile_max = self._OCR_TILE_MAX  # user-configurable, persisted to config
+        self._additive_mode = False               # additive scan mode — accumulates evidence per frame
 
         # Persistent config file next to the exe / script
         _base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
@@ -271,11 +272,12 @@ class ListScannerApp(ctk.CTk):
 
         # Hotkey config: action -> key name string
         self._hotkeys: dict[str, str] = {
-            "start_stop":     "f12",
-            "toggle_overlay": "f11",
-            "toggle_debug":   "f9",
-            "set_area":       "f10",
-            "click_found":    "f8",
+            "start_stop":      "f12",
+            "toggle_overlay":  "f11",
+            "toggle_debug":    "f9",
+            "set_area":        "f10",
+            "click_found":     "f8",
+            "toggle_additive": "f7",
         }
         self._hk_listener = None
         self._closing = False
@@ -333,7 +335,13 @@ class ListScannerApp(ctk.CTk):
             border_width=0,
             font=ctk.CTkFont(size=18),
         )
-        self._config_btn.grid(row=0, column=1, sticky="e")
+        self._mode_lbl = ctk.CTkLabel(
+            header, text="",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#ff9900",
+        )
+        self._mode_lbl.grid(row=0, column=1, sticky="e", padx=(0, 4))
+        self._config_btn.grid(row=0, column=2, sticky="e")
 
         # ── Combined input / results textbox ──
         box_card = ctk.CTkFrame(self)
@@ -358,6 +366,7 @@ class ListScannerApp(ctk.CTk):
         self._tk_text.tag_configure("found",     foreground="#6dff6d", background="#1a4d1a")
         self._tk_text.tag_configure("not_found", foreground="#ff7070", background="#4d1a1a")
         self._tk_text.tag_configure("pending",   foreground="#a0a0a0", background="")
+        self._tk_text.tag_configure("additive",  foreground="#ffcc00", background="#3d2b00")
 
         # ── Control bar ──
         ctrl = ctk.CTkFrame(self)
@@ -527,11 +536,12 @@ class ListScannerApp(ctk.CTk):
             self._hk_listener = None
 
         actions = {
-            "start_stop":     self._toggle_scan,
-            "toggle_overlay": self._toggle_overlay_hotkey,
-            "toggle_debug":   self._toggle_debug,
-            "set_area":       self._set_area,
-            "click_found":    self._do_click_found,
+            "start_stop":      self._toggle_scan,
+            "toggle_overlay":  self._toggle_overlay_hotkey,
+            "toggle_debug":    self._toggle_debug,
+            "set_area":        self._set_area,
+            "click_found":     self._do_click_found,
+            "toggle_additive": self._toggle_additive_mode,
         }
         # Build a plain name -> fn map  (e.g. "f9" -> _toggle_debug)
         key_to_fn: dict[str, object] = {}
@@ -597,14 +607,91 @@ class ListScannerApp(ctk.CTk):
 
         threading.Thread(target=_click, daemon=True).start()
 
+    # ── Additive mode ─────────────────────────────────────────────────────────
+
+    def _toggle_additive_mode(self):
+        """Toggle additive scanning mode on/off via hotkey or programmatically."""
+        self._additive_mode = not self._additive_mode
+        if not self._additive_mode:
+            self._restore_item_texts()
+        self._update_additive_indicator()
+        self._debug_event(
+            f"Additive mode {'enabled' if self._additive_mode else 'disabled'} "
+            f"(hotkey: {self._hotkeys.get('toggle_additive', 'f7').upper()})",
+            "info",
+        )
+
+    def _update_additive_indicator(self):
+        """Show/hide the ADDITIVE label in the header."""
+        self._mode_lbl.configure(text="\u2295 ADDITIVE" if self._additive_mode else "")
+
+    def _update_row_additive(self, idx: int, count: int, locked: bool):
+        """Update a single item row: appends stars (1-3) or shows green at 4."""
+        if idx >= len(self._items):
+            return
+        item = self._items[idx]
+        line_start = f"{idx + 1}.0"
+        line_end   = f"{idx + 1}.end"
+
+        if locked:
+            new_text = item["text"]
+        elif count > 0:
+            new_text = item["text"] + " " + "*" * count
+        else:
+            new_text = item["text"]
+
+        # Temporarily enable the underlying tk.Text to modify content
+        was_disabled = self._tk_text.cget("state") == "disabled"
+        if was_disabled:
+            self._tk_text.configure(state="normal")
+        self._tk_text.delete(line_start, line_end)
+        self._tk_text.insert(line_start, new_text)
+        if was_disabled:
+            self._tk_text.configure(state="disabled")
+
+        # Apply colour tag
+        self._tk_text.tag_remove("found",     line_start, line_end)
+        self._tk_text.tag_remove("not_found", line_start, line_end)
+        self._tk_text.tag_remove("pending",   line_start, line_end)
+        self._tk_text.tag_remove("additive",  line_start, line_end)
+        if locked:
+            self._tk_text.tag_add("found",     line_start, line_end)
+            item["status"] = "found"
+        elif count > 0:
+            self._tk_text.tag_add("additive",  line_start, line_end)
+            item["status"] = "pending"
+        else:
+            self._tk_text.tag_add("not_found", line_start, line_end)
+            item["status"] = "not_found"
+
+    def _restore_item_texts(self):
+        """Remove any additive star text from all item rows, resetting additive state."""
+        has_changes = any(
+            item.get("additive_count", 0) > 0 or item.get("additive_locked", False)
+            for item in self._items
+        )
+        if not has_changes:
+            return
+        self._tk_text.configure(state="normal")
+        for i, item in enumerate(self._items):
+            if item.get("additive_count", 0) > 0 or item.get("additive_locked", False):
+                line_start = f"{i + 1}.0"
+                line_end   = f"{i + 1}.end"
+                self._tk_text.delete(line_start, line_end)
+                self._tk_text.insert(line_start, item["text"])
+                item["additive_count"] = 0
+                item["additive_locked"] = False
+        self._tk_text.configure(state="disabled")
+
     # ── Config popup ──────────────────────────────────────────────────────────
 
     _ACTION_LABELS = {
-        "start_stop":     "Start / Stop",
-        "toggle_overlay": "Toggle Overlay",
-        "toggle_debug":   "Toggle Debug Window",
-        "set_area":       "Set Scan Area",
-        "click_found":    "Click Found Items",
+        "start_stop":      "Start / Stop",
+        "toggle_overlay":  "Toggle Overlay",
+        "toggle_debug":    "Toggle Debug Window",
+        "set_area":        "Set Scan Area",
+        "click_found":     "Click Found Items",
+        "toggle_additive": "Toggle Additive Mode",
     }
 
     def _open_config(self):
@@ -765,6 +852,9 @@ class ListScannerApp(ctk.CTk):
             item["votes"].clear()
             item["status"] = "pending"
             item["last_boxes"] = []
+            item["additive_count"] = 0
+            item["additive_locked"] = False
+        self._restore_item_texts()
         self._reset_colors()
         self._overlay.hide()
         self._debug_event(f"Votes reset; generation={self._scan_gen}", "info")
@@ -1006,6 +1096,8 @@ class ListScannerApp(ctk.CTk):
                 "status": "pending",
                 "votes": deque(maxlen=self._WINDOW_SIZE),
                 "last_boxes": [],
+                "additive_count": 0,
+                "additive_locked": False,
             }
             for ln in lines
         ]
@@ -1078,6 +1170,8 @@ class ListScannerApp(ctk.CTk):
         self._start_btn.configure(fg_color="#2a5c2a", hover_color="#357535")
         self._refresh_start_button()
         self._overlay.hide()
+        # Restore any additive-mode star text before re-enabling the textbox for editing
+        self._restore_item_texts()
         # Unlock textbox for editing and reset colors
         self._text_box.configure(state="normal")
         self._reset_colors()
@@ -1099,6 +1193,7 @@ class ListScannerApp(ctk.CTk):
                 scan_id = self._scan_pass
                 area = dict(self._scan_area)  # snapshot to avoid race
                 gen = self._scan_gen          # capture generation at scan start
+                additive_mode = self._additive_mode  # snapshot mode for this pass
                 self.after(
                     0,
                     self._debug_event,
@@ -1233,31 +1328,66 @@ class ListScannerApp(ctk.CTk):
                     hits = _locate_prepared(item["text"], prepared_ocr, item.get("search_prep"))
                     item["votes"].append(1 if hits else 0)
 
-                    n = len(item["votes"])
-                    vote_sum = sum(item["votes"])
                     if hits and self._scan_gen == gen:
                         item["last_boxes"] = hits
 
-                    # Simple majority: found if more than half of accumulated votes are hits.
-                    # On scan 1: 1/1=100% → instant result.
-                    # On scan 3 after 2 hits + 1 miss: 2/3 > 0.5 → still found.
-                    # On scan 4 after 2 hits + 2 misses: 2/4 = 0.5 → not found.
-                    new_status = "found" if vote_sum > n / 2 else "not_found"
+                    if additive_mode:
+                        # ── Additive mode: accumulate stars, lock at 4 ──────
+                        if not item.get("additive_locked", False):
+                            if hits:
+                                new_count = item.get("additive_count", 0) + 1
+                                item["additive_count"] = new_count
+                                locked = new_count >= 4
+                                if locked:
+                                    item["additive_locked"] = True
+                                    item["status"] = "found"
+                                    changed_statuses.append(f"{item['text']} -> found (additive x4)")
+                                if self._scan_gen == gen:
+                                    self.after(0, self._update_row_additive, i, new_count, locked)
+                            elif item.get("additive_count", 0) == 0:
+                                # No stars yet and no hit → show not_found
+                                if item["status"] != "not_found" and self._scan_gen == gen:
+                                    item["status"] = "not_found"
+                                    self.after(0, self._update_row_additive, i, 0, False)
 
-                    if new_status != item["status"] and self._scan_gen == gen:
-                        item["status"] = new_status
-                        self.after(0, self._update_row, i, new_status)
-                        changed_statuses.append(f"{item['text']} -> {new_status}")
+                        count  = item.get("additive_count", 0)
+                        locked = item.get("additive_locked", False)
+                        if locked:
+                            found_count += 1
+                            all_boxes.extend(item["last_boxes"])
+                        elif count > 0 and item["last_boxes"]:
+                            all_boxes.extend(item["last_boxes"])
 
-                    if item["status"] == "found":
-                        found_count += 1
-                        all_boxes.extend(item["last_boxes"])
+                        tag   = "found" if locked else ("additive" if count > 0 else "not_found")
+                        stars = " " + "*" * count if count > 0 and not locked else ""
+                        debug_lines.append(
+                            (f"  {'✓' if hits else '✗'} [additive:{count}/4] {item['text']}{stars}", tag)
+                        )
+                    else:
+                        # ── Normal mode: rolling majority vote ──────────────
+                        n = len(item["votes"])
+                        vote_sum = sum(item["votes"])
 
-                    tag = "found" if item["status"] == "found" else "not_found"
-                    votes_str = "".join("●" if v else "○" for v in item["votes"])
-                    debug_lines.append(
-                        (f"  {'✓' if hits else '✗'} [{votes_str}] {vote_sum}/{n} {item['text']}", tag)
-                    )
+                        # Simple majority: found if more than half of accumulated votes are hits.
+                        # On scan 1: 1/1=100% → instant result.
+                        # On scan 3 after 2 hits + 1 miss: 2/3 > 0.5 → still found.
+                        # On scan 4 after 2 hits + 2 misses: 2/4 = 0.5 → not found.
+                        new_status = "found" if vote_sum > n / 2 else "not_found"
+
+                        if new_status != item["status"] and self._scan_gen == gen:
+                            item["status"] = new_status
+                            self.after(0, self._update_row, i, new_status)
+                            changed_statuses.append(f"{item['text']} -> {new_status}")
+
+                        if item["status"] == "found":
+                            found_count += 1
+                            all_boxes.extend(item["last_boxes"])
+
+                        tag = "found" if item["status"] == "found" else "not_found"
+                        votes_str = "".join("●" if v else "○" for v in item["votes"])
+                        debug_lines.append(
+                            (f"  {'✓' if hits else '✗'} [{votes_str}] {vote_sum}/{n} {item['text']}", tag)
+                        )
 
                 elapsed_ms = (time.perf_counter() - pass_start) * 1000
                 debug_lines.insert(0, (f"--- Scan {scan_id} (window={self._WINDOW_SIZE}) ---", "info"))
