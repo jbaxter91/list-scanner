@@ -1,0 +1,5 @@
+customtkinter>=5.2.0
+mss>=9.0.1
+Pillow>=10.0.0
+pytesseract>=0.3.10
+pynput>=1.7.0

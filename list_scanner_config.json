@@ -1,0 +1,18 @@
+{
+  "scan_area": {
+    "left": 263,
+    "top": 192,
+    "width": 2249,
+    "height": 1294
+  },
+  "hotkeys": {
+    "start_stop": "f12",
+    "toggle_overlay": "f11",
+    "toggle_debug": "f9",
+    "set_area": "f10",
+    "click_found": "f8"
+  },
+  "ocr_scale": 1.1,
+  "ctrl_click": true,
+  "always_on_top": true
+}
