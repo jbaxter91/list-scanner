@@ -330,12 +330,6 @@ class _RawInputWheelSink:
             ("ulExtraInformation", ctypes.wintypes.ULONG),
         ]
 
-    class RAWINPUTMOUSE(ctypes.Structure):
-        _fields_ = [
-            ("header", RAWINPUTHEADER),
-            ("mouse", RAWMOUSE),
-        ]
-
     class WNDCLASSW(ctypes.Structure):
         _fields_ = [
             ("style", ctypes.wintypes.UINT),
@@ -437,8 +431,10 @@ class _RawInputWheelSink:
                     )
                     if got == size.value:
                         header = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTHEADER)).contents
-                        if header.dwType == self.RIM_TYPEMOUSE and size.value >= ctypes.sizeof(self.RAWINPUTMOUSE):
-                            raw = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTMOUSE)).contents.mouse
+                        min_mouse_bytes = ctypes.sizeof(self.RAWINPUTHEADER) + ctypes.sizeof(self.RAWMOUSE)
+                        if header.dwType == self.RIM_TYPEMOUSE and size.value >= min_mouse_bytes:
+                            raw_ptr = ctypes.c_void_p(ctypes.addressof(buf) + ctypes.sizeof(self.RAWINPUTHEADER))
+                            raw = ctypes.cast(raw_ptr, ctypes.POINTER(self.RAWMOUSE)).contents
                             flags = raw.ulButtons & 0xFFFF
                             if flags & (self.RI_MOUSE_WHEEL | self.RI_MOUSE_HWHEEL):
                                 try:
