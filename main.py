@@ -877,6 +877,33 @@ class ListScannerApp(ctk.CTk):
     def _reset_votes(self):
         """Clear all vote histories and hide overlay — called on mouse interaction."""
         self._scan_gen += 1  # invalidate any in-flight scan results
+
+        if self._additive_mode:
+            locked_count = 0
+            for i, item in enumerate(self._items):
+                item["votes"].clear()
+                if item.get("additive_locked", False):
+                    locked_count += 1
+                    item["status"] = "found"
+                    item["additive_count"] = max(4, item.get("additive_count", 0))
+                    # Preserve locked-green state, but clear stale overlay boxes.
+                    item["last_boxes"] = []
+                    self._update_row_additive(i, item["additive_count"], True)
+                    continue
+
+                item["status"] = "pending"
+                item["last_boxes"] = []
+                item["additive_count"] = 0
+                item["additive_locked"] = False
+                self._update_row_additive(i, 0, False)
+
+            self._overlay.hide()
+            self._debug_event(
+                f"Votes reset; generation={self._scan_gen}; additive_locked_preserved={locked_count}",
+                "info",
+            )
+            return
+
         for item in self._items:
             item["votes"].clear()
             item["status"] = "pending"
