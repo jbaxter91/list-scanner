@@ -243,6 +243,8 @@ class ListScannerApp(ctk.CTk):
     _OCR_TILE_TARGET_PX = 500
     _OCR_TILE_MIN_PX = 250
     _OCR_TILE_OVERLAP_PX = 30
+    _OCR_DYNAMIC_OVERLAP_CHAR_PX = 7
+    _OCR_DYNAMIC_OVERLAP_PAD_PX = 8
     _OCR_TILE_MAX = 16
     _ADDITIVE_LOCK_FRAMES = 3
 
@@ -1267,12 +1269,14 @@ class ListScannerApp(ctk.CTk):
         self._set_status("Scanning…")
         self._scan_pass = 0
         area = self._scan_area
+        overlap_px = self._effective_tile_overlap_px()
+        longest_token_chars = self._longest_search_token_chars()
         self._debug_event(
             f"Scanning started: items={len(self._items)}, area={area['width']}x{area['height']} "
             f"at ({area['left']},{area['top']}), scale={self._ocr_scale:.1f}x, "
             f"ocr_mode={'digits-only' if self._ocr_digits_only else 'general'}, lang=eng, "
             f"adaptive_tiles=target{self._ocr_tile_target_px}px/min{self._OCR_TILE_MIN_PX}px/"
-            f"overlap{self._ocr_tile_overlap_px}px/max{self._ocr_tile_max}, "
+            f"overlap{self._ocr_tile_overlap_px}px(eff {overlap_px}px, longest_token={longest_token_chars})/max{self._ocr_tile_max}, "
             f"overlay={'on' if self._show_overlay else 'off'}, screenshot_preview="
             f"{'on' if self._show_debug_screenshot else 'off'}",
             "info",
@@ -1428,13 +1432,14 @@ class ListScannerApp(ctk.CTk):
                                f"Scan {scan_id}: frame unchanged — reusing cached OCR (saved {_cached_ocr_ms:.0f}ms)",
                                "info")
                 else:
+                    overlap_px = self._effective_tile_overlap_px()
                     pass_result = self._ocr_engine.run_pass(
                         gray=gray,
                         scale=_SCALE,
                         digits_only=self._ocr_digits_only,
                         target_px=self._ocr_tile_target_px,
                         min_tile_px=self._OCR_TILE_MIN_PX,
-                        overlap_px=self._ocr_tile_overlap_px,
+                        overlap_px=overlap_px,
                         max_tiles=self._effective_tile_max(),
                     )
                     prepared_ocr = pass_result.prepared_ocr
@@ -1521,6 +1526,27 @@ class ListScannerApp(ctk.CTk):
     def _effective_tile_max(self) -> int:
         cpu = os.cpu_count() or 4
         return max(1, min(self._ocr_tile_max, cpu * 2))
+
+    def _longest_search_token_chars(self) -> int:
+        longest = 0
+        for item in self._items:
+            prep = item.get("search_prep") or {}
+            for key in ("query", "sep_query"):
+                for token in prep.get(key, []):
+                    if token:
+                        longest = max(longest, len(token))
+        return longest
+
+    def _effective_tile_overlap_px(self) -> int:
+        configured = max(0, int(self._ocr_tile_overlap_px))
+        longest = self._longest_search_token_chars()
+        if longest <= 0:
+            return configured
+
+        estimated = int(longest * self._OCR_DYNAMIC_OVERLAP_CHAR_PX + self._OCR_DYNAMIC_OVERLAP_PAD_PX)
+        # Keep overlap below target tile size to avoid degenerate step size.
+        max_safe_overlap = max(0, int(self._ocr_tile_target_px) - 1)
+        return min(max(configured, estimated), max_safe_overlap)
 
     def _close_debug_win(self):
         """Close the debug window and reset tracking state."""
