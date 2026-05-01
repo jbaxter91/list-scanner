@@ -29,7 +29,8 @@ class OcrEngine:
         digits_only: bool,
         target_px: int,
         min_tile_px: int,
-        overlap_px: int,
+        overlap_x_px: int,
+        overlap_y_px: int,
         max_tiles: int,
     ) -> OcrPassResult:
         ocr_start = time.perf_counter()
@@ -46,7 +47,8 @@ class OcrEngine:
             height=h,
             target_px=target_px,
             min_tile_px=min_tile_px,
-            overlap_px=overlap_px,
+            overlap_x_px=overlap_x_px,
+            overlap_y_px=overlap_y_px,
             max_tiles=max_tiles,
         )
         tile_desc = f"{cols}x{rows} ({len(tiles)} tile{'s' if len(tiles) != 1 else ''})"
@@ -103,12 +105,14 @@ class OcrEngine:
         height: int,
         target_px: int,
         min_tile_px: int,
-        overlap_px: int,
+        overlap_x_px: int,
+        overlap_y_px: int,
         max_tiles: int,
     ) -> tuple[int, int, list[dict]]:
-        step = max(1, target_px - overlap_px)
-        cols = max(1, math.ceil(max(1, width - overlap_px) / step))
-        rows = max(1, math.ceil(max(1, height - overlap_px) / step))
+        step_x = max(1, target_px - overlap_x_px)
+        step_y = max(1, target_px - overlap_y_px)
+        cols = max(1, math.ceil(max(1, width - overlap_x_px) / step_x))
+        rows = max(1, math.ceil(max(1, height - overlap_y_px) / step_y))
 
         while cols > 1 and (width / cols) < min_tile_px:
             cols -= 1
@@ -125,7 +129,8 @@ class OcrEngine:
 
         base_w = (width + cols - 1) // cols
         base_h = (height + rows - 1) // rows
-        overlap = max(0, overlap_px)
+        overlap_x = max(0, overlap_x_px)
+        overlap_y = max(0, overlap_y_px)
 
         tiles: list[dict] = []
         for r in range(rows):
@@ -135,10 +140,10 @@ class OcrEngine:
                 x1 = min(width, (c + 1) * base_w)
                 y1 = min(height, (r + 1) * base_h)
 
-                tx0 = max(0, x0 - overlap)
-                ty0 = max(0, y0 - overlap)
-                tx1 = min(width, x1 + overlap)
-                ty1 = min(height, y1 + overlap)
+                tx0 = max(0, x0 - overlap_x)
+                ty0 = max(0, y0 - overlap_y)
+                tx1 = min(width, x1 + overlap_x)
+                ty1 = min(height, y1 + overlap_y)
 
                 tiles.append(
                     {
