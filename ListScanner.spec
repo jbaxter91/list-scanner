@@ -78,13 +78,20 @@ _tess_binaries = [
 # Collect tessdata language files
 _tessdata_dir = os.path.join(_tess_dir, "tessdata")
 _tess_data = []
+_include_osd = os.environ.get("LISTSCANNER_INCLUDE_OSD", "0").strip().lower() in {"1", "true", "yes", "on"}
+_allowed_tessdata = {"eng.traineddata"}
+if _include_osd:
+    _allowed_tessdata.add("osd.traineddata")
 if os.path.isdir(_tessdata_dir):
     for f in os.listdir(_tessdata_dir):
         full = os.path.join(_tessdata_dir, f)
-        if os.path.isfile(full):
+        if os.path.isfile(full) and f.lower() in _allowed_tessdata:
             _tess_data.append((full, os.path.join("tesseract", "tessdata")))
 
-print(f"[spec] {len(_tess_binaries)} binaries, {len(_tess_data)} tessdata files")
+print(
+    f"[spec] {len(_tess_binaries)} binaries, {len(_tess_data)} tessdata files "
+    f"(osd={'on' if _include_osd else 'off'})"
+)
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 a = Analysis(
@@ -112,7 +119,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX can cause runtime instability on some machines/AV setups.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
