@@ -877,36 +877,6 @@ class ListScannerApp(ctk.CTk):
     def _reset_votes(self):
         """Clear all vote histories and hide overlay — called on mouse interaction."""
         self._scan_gen += 1  # invalidate any in-flight scan results
-
-        if self._additive_mode:
-            # In additive mode, preserve locked-green entries across mouse interaction.
-            locked_count = 0
-            for i, item in enumerate(self._items):
-                item["votes"].clear()
-                if item.get("additive_locked", False):
-                    locked_count += 1
-                    item["status"] = "found"
-                    item["additive_count"] = max(4, item.get("additive_count", 0))
-                    # Keep the green lock state, but clear stale display boxes.
-                    item["last_boxes"] = []
-                    self._update_row_additive(i, item["additive_count"], True)
-                    continue
-
-                item["status"] = "pending"
-                item["last_boxes"] = []
-                item["additive_count"] = 0
-                item["additive_locked"] = False
-                self._update_row_additive(i, 0, False)
-
-            # Always clear display boxes on reset, even for locked entries.
-            self._overlay.hide()
-
-            self._debug_event(
-                f"Votes reset; generation={self._scan_gen}; additive_locked_preserved={locked_count}",
-                "info",
-            )
-            return
-
         for item in self._items:
             item["votes"].clear()
             item["status"] = "pending"
@@ -1278,13 +1248,7 @@ class ListScannerApp(ctk.CTk):
                 orig_img = ImageGrab.grab(bbox=bbox, all_screens=True)
                 grab_ms = (time.perf_counter() - pass_start) * 1000
 
-                # Only restore previous boxes if no reset happened during the grab
-                if self._scan_gen == gen:
-                    prev_boxes = [b for item in self._items for b in item.get("last_boxes", [])]
-                    if self._show_overlay and prev_boxes:
-                        self.after(0, lambda a=area, b=prev_boxes, g=gen:
-                            self._overlay.show(a, b) if self._scan_gen == g else None)
-                        self.after(0, self._debug_event, f"Scan {scan_id}: restored {len(prev_boxes)} previous overlay box(es)", "info")
+                # Keep overlay hidden until current-pass OCR completes to avoid ghost boxes.
 
                 # If a reset happened during the grab/OCR, discard this scan entirely
                 if self._scan_gen != gen:
@@ -1387,8 +1351,8 @@ class ListScannerApp(ctk.CTk):
                     hits = _locate_prepared(item["text"], prepared_ocr, item.get("search_prep"))
                     item["votes"].append(1 if hits else 0)
 
-                    if hits and self._scan_gen == gen:
-                        item["last_boxes"] = hits
+                    if self._scan_gen == gen:
+                        item["last_boxes"] = hits if hits else []
 
                     if additive_mode:
                         # ── Additive mode: accumulate stars, lock at 4 ──────
