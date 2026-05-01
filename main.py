@@ -292,6 +292,225 @@ class _GlobalScrollEventHook:
         self._running = False
 
 
+class _RawInputWheelSink:
+    """Global raw-input wheel sink (receives wheel input without app focus)."""
+
+    WM_INPUT = 0x00FF
+    WM_CLOSE = 0x0010
+    RID_INPUT = 0x10000003
+    RIM_TYPEMOUSE = 0
+    RI_MOUSE_WHEEL = 0x0400
+    RI_MOUSE_HWHEEL = 0x0800
+    RIDEV_INPUTSINK = 0x00000100
+    HWND_MESSAGE = ctypes.c_void_p(-3).value
+
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [
+            ("usUsagePage", ctypes.wintypes.USHORT),
+            ("usUsage", ctypes.wintypes.USHORT),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("hwndTarget", ctypes.wintypes.HWND),
+        ]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [
+            ("dwType", ctypes.wintypes.DWORD),
+            ("dwSize", ctypes.wintypes.DWORD),
+            ("hDevice", ctypes.wintypes.HANDLE),
+            ("wParam", ctypes.wintypes.WPARAM),
+        ]
+
+    class RAWMOUSE(ctypes.Structure):
+        _fields_ = [
+            ("usFlags", ctypes.wintypes.USHORT),
+            ("ulButtons", ctypes.wintypes.ULONG),
+            ("ulRawButtons", ctypes.wintypes.ULONG),
+            ("lLastX", ctypes.wintypes.LONG),
+            ("lLastY", ctypes.wintypes.LONG),
+            ("ulExtraInformation", ctypes.wintypes.ULONG),
+        ]
+
+    class RAWINPUTMOUSE(ctypes.Structure):
+        _fields_ = [
+            ("header", RAWINPUTHEADER),
+            ("mouse", RAWMOUSE),
+        ]
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", ctypes.wintypes.UINT),
+            ("lpfnWndProc", ctypes.c_void_p),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", ctypes.c_void_p),
+            ("hIcon", ctypes.c_void_p),
+            ("hCursor", ctypes.c_void_p),
+            ("hbrBackground", ctypes.c_void_p),
+            ("lpszMenuName", ctypes.wintypes.LPCWSTR),
+            ("lpszClassName", ctypes.wintypes.LPCWSTR),
+        ]
+
+    def __init__(self, on_scroll):
+        self._on_scroll = on_scroll
+        self._thread = None
+        self._thread_id = 0
+        self._running = False
+        self._started_ok = False
+        self._started_evt = threading.Event()
+        self._hwnd = None
+        self._class_name = None
+        self._wndproc = None
+
+    def start(self):
+        if self._running:
+            return self._started_ok
+        self._running = True
+        self._started_ok = False
+        self._started_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._started_evt.wait(timeout=0.5)
+        return self._started_ok
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        user32 = ctypes.windll.user32
+        if self._hwnd:
+            user32.PostMessageW(self._hwnd, self.WM_CLOSE, 0, 0)
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self._thread is not None:
+            self._thread.join(timeout=0.75)
+        self._thread = None
+
+    def _run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.wintypes.HWND, ctypes.wintypes.UINT, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+        user32.RegisterClassW.restype = ctypes.wintypes.ATOM
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(self.WNDCLASSW)]
+        user32.CreateWindowExW.restype = ctypes.wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.HMENU,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        user32.DefWindowProcW.restype = LRESULT
+        user32.DefWindowProcW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+        user32.RegisterRawInputDevices.restype = ctypes.wintypes.BOOL
+        user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(self.RAWINPUTDEVICE), ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        user32.GetRawInputData.restype = ctypes.wintypes.UINT
+        user32.GetRawInputData.argtypes = [ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.UINT), ctypes.wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+
+        def wnd_proc(hwnd, msg, w_param, l_param):
+            if msg == self.WM_INPUT:
+                size = ctypes.wintypes.UINT(0)
+                hdr_size = ctypes.sizeof(self.RAWINPUTHEADER)
+                user32.GetRawInputData(ctypes.c_void_p(l_param), self.RID_INPUT, None, ctypes.byref(size), hdr_size)
+                if size.value:
+                    buf = ctypes.create_string_buffer(size.value)
+                    got = user32.GetRawInputData(
+                        ctypes.c_void_p(l_param),
+                        self.RID_INPUT,
+                        buf,
+                        ctypes.byref(size),
+                        hdr_size,
+                    )
+                    if got == size.value:
+                        header = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTHEADER)).contents
+                        if header.dwType == self.RIM_TYPEMOUSE and size.value >= ctypes.sizeof(self.RAWINPUTMOUSE):
+                            raw = ctypes.cast(buf, ctypes.POINTER(self.RAWINPUTMOUSE)).contents.mouse
+                            flags = raw.ulButtons & 0xFFFF
+                            if flags & (self.RI_MOUSE_WHEEL | self.RI_MOUSE_HWHEEL):
+                                try:
+                                    self._on_scroll()
+                                except Exception:
+                                    pass
+                return 0
+            if msg == self.WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
+
+        self._wndproc = WNDPROC(wnd_proc)
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._class_name = f"ListScannerRawInputSink_{self._thread_id}"
+
+        wc = self.WNDCLASSW()
+        wc.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p).value
+        wc.hInstance = kernel32.GetModuleHandleW(None)
+        wc.lpszClassName = self._class_name
+        atom = user32.RegisterClassW(ctypes.byref(wc))
+        if not atom:
+            self._started_evt.set()
+            self._running = False
+            return
+
+        self._hwnd = user32.CreateWindowExW(
+            0,
+            self._class_name,
+            "",
+            0,
+            0,
+            0,
+            0,
+            0,
+            self.HWND_MESSAGE,
+            0,
+            wc.hInstance,
+            0,
+        )
+        if not self._hwnd:
+            self._started_evt.set()
+            self._running = False
+            return
+
+        rid = self.RAWINPUTDEVICE(
+            usUsagePage=0x01,  # Generic desktop controls
+            usUsage=0x02,      # Mouse
+            dwFlags=self.RIDEV_INPUTSINK,
+            hwndTarget=self._hwnd,
+        )
+        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(self.RAWINPUTDEVICE)):
+            self._started_evt.set()
+            self._running = False
+            return
+
+        self._started_ok = True
+        self._started_evt.set()
+
+        msg = ctypes.wintypes.MSG()
+        while self._running:
+            gm = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+            if gm <= 0:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        self._hwnd = None
+        self._thread_id = 0
+        self._running = False
+
+
 
 
 # =============================================================================
@@ -1190,6 +1409,21 @@ class ListScannerApp(ctk.CTk):
                 self._debug_event("Global scroll event hook failed to initialize", "warn")
                 self._scroll_event_hook = None
 
+        # Raw input sink catches wheel-style HID input globally, including many
+        # precision touchpad drivers that do not surface via classic wheel hooks.
+        self._raw_input_hook = None
+        if sys.platform == "win32":
+            try:
+                self._raw_input_hook = _RawInputWheelSink(
+                    on_scroll=lambda: self._queue_input_reset("raw_input_wheel") if self._scanning else None
+                )
+                if not self._raw_input_hook.start():
+                    self._debug_event("Raw input wheel hook failed to start", "warn")
+                    self._raw_input_hook = None
+            except Exception:
+                self._debug_event("Raw input wheel hook failed to initialize", "warn")
+                self._raw_input_hook = None
+
     def _queue_input_reset(self, source: str):
         """Schedule a vote reset and include the trigger source in debug output."""
         self.after(0, self._reset_votes, source)
@@ -1870,6 +2104,12 @@ class ListScannerApp(ctk.CTk):
             except Exception:
                 pass
             self._scroll_event_hook = None
+        if hasattr(self, "_raw_input_hook") and self._raw_input_hook is not None:
+            try:
+                self._raw_input_hook.stop()
+            except Exception:
+                pass
+            self._raw_input_hook = None
         self._save_config()
         self._close_config_win()
         self._close_debug_win()
