@@ -240,6 +240,7 @@ class ListScannerApp(ctk.CTk):
     _OCR_TILE_MIN_PX = 250
     _OCR_TILE_OVERLAP_PX = 30
     _OCR_TILE_MAX = 16
+    _ADDITIVE_LOCK_FRAMES = 4
 
     def __init__(self):
         super().__init__()
@@ -874,6 +875,26 @@ class ListScannerApp(ctk.CTk):
         self._mouse_listener.daemon = True
         self._mouse_listener.start()
 
+    def _reset_item_for_input(self, idx: int, item: dict, preserve_locked_additive: bool) -> bool:
+        """Reset one row for a click/scroll event. Returns True when a locked additive row was kept."""
+        item["votes"].clear()
+
+        if preserve_locked_additive and item.get("additive_locked", False):
+            item["status"] = "found"
+            item["additive_count"] = max(self._ADDITIVE_LOCK_FRAMES, item.get("additive_count", 0))
+            # Preserve locked-green state, but clear stale overlay boxes.
+            item["last_boxes"] = []
+            self._update_row_additive(idx, item["additive_count"], True)
+            return True
+
+        item["status"] = "pending"
+        item["last_boxes"] = []
+        item["additive_count"] = 0
+        item["additive_locked"] = False
+        if self._additive_mode:
+            self._update_row_additive(idx, 0, False)
+        return False
+
     def _reset_votes(self):
         """Clear all vote histories and hide overlay — called on mouse interaction."""
         self._scan_gen += 1  # invalidate any in-flight scan results
@@ -881,21 +902,8 @@ class ListScannerApp(ctk.CTk):
         if self._additive_mode:
             locked_count = 0
             for i, item in enumerate(self._items):
-                item["votes"].clear()
-                if item.get("additive_locked", False):
+                if self._reset_item_for_input(i, item, preserve_locked_additive=True):
                     locked_count += 1
-                    item["status"] = "found"
-                    item["additive_count"] = max(4, item.get("additive_count", 0))
-                    # Preserve locked-green state, but clear stale overlay boxes.
-                    item["last_boxes"] = []
-                    self._update_row_additive(i, item["additive_count"], True)
-                    continue
-
-                item["status"] = "pending"
-                item["last_boxes"] = []
-                item["additive_count"] = 0
-                item["additive_locked"] = False
-                self._update_row_additive(i, 0, False)
 
             self._overlay.hide()
             self._debug_event(
@@ -904,12 +912,8 @@ class ListScannerApp(ctk.CTk):
             )
             return
 
-        for item in self._items:
-            item["votes"].clear()
-            item["status"] = "pending"
-            item["last_boxes"] = []
-            item["additive_count"] = 0
-            item["additive_locked"] = False
+        for i, item in enumerate(self._items):
+            self._reset_item_for_input(i, item, preserve_locked_additive=False)
         self._restore_item_texts()
         self._reset_colors()
         self._overlay.hide()
@@ -1235,6 +1239,71 @@ class ListScannerApp(ctk.CTk):
         self._set_status("Stopped")
         self._debug_event("Scanning stopped", "info")
 
+    def _update_item_boxes_for_scan(self, item: dict, hits: list[tuple], gen: int):
+        """Persist only current-pass hit boxes; clear stale geometry on misses."""
+        if self._scan_gen == gen:
+            item["last_boxes"] = hits if hits else []
+
+    def _process_additive_item_scan(
+        self,
+        idx: int,
+        item: dict,
+        hits: list[tuple],
+        gen: int,
+    ) -> tuple[int, list[tuple], tuple[str, str], str | None]:
+        """Update one row for additive mode and return render/debug outputs."""
+        status_change = None
+
+        if not item.get("additive_locked", False):
+            if hits:
+                new_count = item.get("additive_count", 0) + 1
+                item["additive_count"] = new_count
+                locked = new_count >= self._ADDITIVE_LOCK_FRAMES
+                if locked:
+                    item["additive_locked"] = True
+                    item["status"] = "found"
+                    status_change = f"{item['text']} -> found (additive x{self._ADDITIVE_LOCK_FRAMES})"
+                if self._scan_gen == gen:
+                    self.after(0, self._update_row_additive, idx, new_count, locked)
+            elif item.get("additive_count", 0) == 0:
+                # No stars yet and no hit -> show not_found
+                if item["status"] != "not_found" and self._scan_gen == gen:
+                    item["status"] = "not_found"
+                    self.after(0, self._update_row_additive, idx, 0, False)
+
+        count = item.get("additive_count", 0)
+        locked = item.get("additive_locked", False)
+        boxes = item["last_boxes"] if (locked or (count > 0 and item["last_boxes"])) else []
+        tag = "found" if locked else ("additive" if count > 0 else "not_found")
+        stars = " " + "*" * count if count > 0 and not locked else ""
+        line = f"  {'✓' if hits else '✗'} [additive:{count}/{self._ADDITIVE_LOCK_FRAMES}] {item['text']}{stars}"
+        return (1 if locked else 0), boxes, (line, tag), status_change
+
+    def _process_normal_item_scan(
+        self,
+        idx: int,
+        item: dict,
+        hits: list[tuple],
+        gen: int,
+    ) -> tuple[int, list[tuple], tuple[str, str], str | None]:
+        """Update one row for normal (majority-vote) mode and return outputs."""
+        n = len(item["votes"])
+        vote_sum = sum(item["votes"])
+
+        # Found when more than half of accumulated votes are hits.
+        new_status = "found" if vote_sum > n / 2 else "not_found"
+        status_change = None
+        if new_status != item["status"] and self._scan_gen == gen:
+            item["status"] = new_status
+            self.after(0, self._update_row, idx, new_status)
+            status_change = f"{item['text']} -> {new_status}"
+
+        boxes = item["last_boxes"] if item["status"] == "found" else []
+        tag = "found" if item["status"] == "found" else "not_found"
+        votes_str = "".join("●" if v else "○" for v in item["votes"])
+        line = f"  {'✓' if hits else '✗'} [{votes_str}] {vote_sum}/{n} {item['text']}"
+        return (1 if item["status"] == "found" else 0), boxes, (line, tag), status_change
+
     def _loop(self):
         _last_frame_hash: int | None = None
         _cached_prepared_ocr: dict | None = None
@@ -1258,8 +1327,7 @@ class ListScannerApp(ctk.CTk):
                     "info",
                 )
 
-                # Hide overlay only for the instant of the grab, then immediately
-                # restore previous boxes — OCR runs while overlay is already back up.
+                # Hide overlay just for the capture to avoid OCR reading its own boxes.
                 hide_done = threading.Event()
                 self.after(0, lambda e=hide_done: (self._overlay.hide(), e.set()))
                 hide_done.wait(timeout=0.3)
@@ -1377,67 +1445,23 @@ class ListScannerApp(ctk.CTk):
                 for i, item in enumerate(items_snapshot):
                     hits = _locate_prepared(item["text"], prepared_ocr, item.get("search_prep"))
                     item["votes"].append(1 if hits else 0)
-
-                    if self._scan_gen == gen:
-                        item["last_boxes"] = hits if hits else []
+                    self._update_item_boxes_for_scan(item, hits, gen)
 
                     if additive_mode:
-                        # ── Additive mode: accumulate stars, lock at 4 ──────
-                        if not item.get("additive_locked", False):
-                            if hits:
-                                new_count = item.get("additive_count", 0) + 1
-                                item["additive_count"] = new_count
-                                locked = new_count >= 4
-                                if locked:
-                                    item["additive_locked"] = True
-                                    item["status"] = "found"
-                                    changed_statuses.append(f"{item['text']} -> found (additive x4)")
-                                if self._scan_gen == gen:
-                                    self.after(0, self._update_row_additive, i, new_count, locked)
-                            elif item.get("additive_count", 0) == 0:
-                                # No stars yet and no hit → show not_found
-                                if item["status"] != "not_found" and self._scan_gen == gen:
-                                    item["status"] = "not_found"
-                                    self.after(0, self._update_row_additive, i, 0, False)
-
-                        count  = item.get("additive_count", 0)
-                        locked = item.get("additive_locked", False)
-                        if locked:
-                            found_count += 1
-                            all_boxes.extend(item["last_boxes"])
-                        elif count > 0 and item["last_boxes"]:
-                            all_boxes.extend(item["last_boxes"])
-
-                        tag   = "found" if locked else ("additive" if count > 0 else "not_found")
-                        stars = " " + "*" * count if count > 0 and not locked else ""
-                        debug_lines.append(
-                            (f"  {'✓' if hits else '✗'} [additive:{count}/4] {item['text']}{stars}", tag)
+                        found_inc, item_boxes, debug_entry, status_change = self._process_additive_item_scan(
+                            i, item, hits, gen
                         )
                     else:
-                        # ── Normal mode: rolling majority vote ──────────────
-                        n = len(item["votes"])
-                        vote_sum = sum(item["votes"])
-
-                        # Simple majority: found if more than half of accumulated votes are hits.
-                        # On scan 1: 1/1=100% → instant result.
-                        # On scan 3 after 2 hits + 1 miss: 2/3 > 0.5 → still found.
-                        # On scan 4 after 2 hits + 2 misses: 2/4 = 0.5 → not found.
-                        new_status = "found" if vote_sum > n / 2 else "not_found"
-
-                        if new_status != item["status"] and self._scan_gen == gen:
-                            item["status"] = new_status
-                            self.after(0, self._update_row, i, new_status)
-                            changed_statuses.append(f"{item['text']} -> {new_status}")
-
-                        if item["status"] == "found":
-                            found_count += 1
-                            all_boxes.extend(item["last_boxes"])
-
-                        tag = "found" if item["status"] == "found" else "not_found"
-                        votes_str = "".join("●" if v else "○" for v in item["votes"])
-                        debug_lines.append(
-                            (f"  {'✓' if hits else '✗'} [{votes_str}] {vote_sum}/{n} {item['text']}", tag)
+                        found_inc, item_boxes, debug_entry, status_change = self._process_normal_item_scan(
+                            i, item, hits, gen
                         )
+
+                    found_count += found_inc
+                    if item_boxes:
+                        all_boxes.extend(item_boxes)
+                    debug_lines.append(debug_entry)
+                    if status_change:
+                        changed_statuses.append(status_change)
 
                 elapsed_ms = (time.perf_counter() - pass_start) * 1000
                 debug_lines.insert(0, (f"--- Scan {scan_id} (window={self._WINDOW_SIZE}) ---", "info"))
