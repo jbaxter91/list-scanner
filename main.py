@@ -502,7 +502,7 @@ class _RawInputWheelSink:
                 hwndTarget=self._hwnd,
             ),
         )
-        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 2, ctypes.sizeof(self.RAWINPUTDEVICE)):
+        if not user32.RegisterRawInputDevices(rid, 2, ctypes.sizeof(self.RAWINPUTDEVICE)):
             self._started_evt.set()
             self._running = False
             return
