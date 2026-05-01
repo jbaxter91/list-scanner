@@ -179,6 +179,119 @@ class _GlobalWheelHook:
         self._running = False
 
 
+class _GlobalScrollEventHook:
+    """Windows global scroll-start WinEvent hook (works across focused apps)."""
+
+    EVENT_SYSTEM_SCROLLINGSTART = 0x0012
+    WINEVENT_OUTOFCONTEXT = 0x0000
+    WINEVENT_SKIPOWNPROCESS = 0x0002
+
+    def __init__(self, on_scroll):
+        self._on_scroll = on_scroll
+        self._hook = None
+        self._cb = None
+        self._thread = None
+        self._thread_id = 0
+        self._running = False
+        self._started_ok = False
+        self._started_evt = threading.Event()
+
+    def start(self):
+        if self._running:
+            return self._started_ok
+        self._running = True
+        self._started_ok = False
+        self._started_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._started_evt.wait(timeout=0.35)
+        return self._started_ok
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+
+    def _run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        HWINEVENTHOOK = ctypes.c_void_p
+        WINEVENTPROC = ctypes.WINFUNCTYPE(
+            None,
+            HWINEVENTHOOK,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LONG,
+            ctypes.wintypes.LONG,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+        )
+
+        user32.SetWinEventHook.restype = HWINEVENTHOOK
+        user32.SetWinEventHook.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+            ctypes.c_void_p,
+            WINEVENTPROC,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.DWORD,
+        ]
+        user32.UnhookWinEvent.restype = ctypes.wintypes.BOOL
+        user32.UnhookWinEvent.argtypes = [HWINEVENTHOOK]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+
+        def win_event_proc(hook, event, hwnd, obj_id, child_id, event_thread, event_time):
+            if event == self.EVENT_SYSTEM_SCROLLINGSTART:
+                try:
+                    self._on_scroll()
+                except Exception:
+                    pass
+
+        self._cb = WINEVENTPROC(win_event_proc)
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._hook = user32.SetWinEventHook(
+            self.EVENT_SYSTEM_SCROLLINGSTART,
+            self.EVENT_SYSTEM_SCROLLINGSTART,
+            0,
+            self._cb,
+            0,
+            0,
+            self.WINEVENT_OUTOFCONTEXT | self.WINEVENT_SKIPOWNPROCESS,
+        )
+
+        if not self._hook:
+            self._started_ok = False
+            self._started_evt.set()
+            self._running = False
+            return
+
+        self._started_ok = True
+        self._started_evt.set()
+
+        msg = ctypes.wintypes.MSG()
+        while self._running:
+            gm = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+            if gm <= 0:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._hook:
+            user32.UnhookWinEvent(self._hook)
+            self._hook = None
+        self._thread_id = 0
+        self._running = False
+
+
 
 
 # =============================================================================
@@ -1062,6 +1175,21 @@ class ListScannerApp(ctk.CTk):
                 self._debug_event("Trackpad wheel hook failed to initialize; using tk/pynput fallbacks", "warn")
                 self._wheel_hook = None
 
+        # Additional global scroll-start event hook to catch precision touchpad scrolling
+        # in other focused applications.
+        self._scroll_event_hook = None
+        if sys.platform == "win32":
+            try:
+                self._scroll_event_hook = _GlobalScrollEventHook(
+                    on_scroll=lambda: self._queue_input_reset("win_scroll_event") if self._scanning else None
+                )
+                if not self._scroll_event_hook.start():
+                    self._debug_event("Global scroll event hook failed to start", "warn")
+                    self._scroll_event_hook = None
+            except Exception:
+                self._debug_event("Global scroll event hook failed to initialize", "warn")
+                self._scroll_event_hook = None
+
     def _queue_input_reset(self, source: str):
         """Schedule a vote reset and include the trigger source in debug output."""
         self.after(0, self._reset_votes, source)
@@ -1736,6 +1864,12 @@ class ListScannerApp(ctk.CTk):
             except Exception:
                 pass
             self._wheel_hook = None
+        if hasattr(self, "_scroll_event_hook") and self._scroll_event_hook is not None:
+            try:
+                self._scroll_event_hook.stop()
+            except Exception:
+                pass
+            self._scroll_event_hook = None
         self._save_config()
         self._close_config_win()
         self._close_debug_win()
