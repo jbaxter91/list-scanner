@@ -102,13 +102,19 @@ class _GlobalWheelHook:
         self._thread = None
         self._thread_id = 0
         self._running = False
+        self._started_ok = False
+        self._started_evt = threading.Event()
 
     def start(self):
         if self._running:
-            return
+            return self._started_ok
         self._running = True
+        self._started_ok = False
+        self._started_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._started_evt.wait(timeout=0.35)
+        return self._started_ok
 
     def stop(self):
         if not self._running:
@@ -127,6 +133,17 @@ class _GlobalWheelHook:
         LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
 
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, ctypes.wintypes.DWORD]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+        user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+
         def low_level_mouse_proc(n_code, w_param, l_param):
             if n_code == self.HC_ACTION and w_param in (self.WM_MOUSEWHEEL, self.WM_MOUSEHWHEEL):
                 try:
@@ -139,11 +156,19 @@ class _GlobalWheelHook:
         self._thread_id = kernel32.GetCurrentThreadId()
         self._hook = user32.SetWindowsHookExW(self.WH_MOUSE_LL, self._cb, kernel32.GetModuleHandleW(None), 0)
         if not self._hook:
+            self._started_ok = False
+            self._started_evt.set()
             self._running = False
             return
 
+        self._started_ok = True
+        self._started_evt.set()
+
         msg = ctypes.wintypes.MSG()
-        while self._running and user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+        while self._running:
+            gm = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+            if gm <= 0:
+                break
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -1015,6 +1040,14 @@ class ListScannerApp(ctk.CTk):
         self._mouse_listener.daemon = True
         self._mouse_listener.start()
 
+        def on_tk_scroll(_event):
+            if self._scanning:
+                self._reset_votes()
+
+        # Fallback path for trackpad gestures delivered to the app window.
+        self.bind_all("<MouseWheel>", on_tk_scroll, add="+")
+        self.bind_all("<Shift-MouseWheel>", on_tk_scroll, add="+")
+
         # Backup wheel hook for precision trackpads that may not emit pynput scroll events.
         self._wheel_hook = None
         if sys.platform == "win32":
@@ -1022,7 +1055,8 @@ class ListScannerApp(ctk.CTk):
                 self._wheel_hook = _GlobalWheelHook(
                     on_scroll=lambda: self.after(0, self._reset_votes) if self._scanning else None
                 )
-                self._wheel_hook.start()
+                if not self._wheel_hook.start():
+                    self._wheel_hook = None
             except Exception:
                 self._wheel_hook = None
 
