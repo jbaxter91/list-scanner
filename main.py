@@ -243,8 +243,8 @@ class ListScannerApp(ctk.CTk):
     _OCR_TILE_TARGET_PX = 500
     _OCR_TILE_MIN_PX = 250
     _OCR_TILE_OVERLAP_PX = 30
-    _OCR_DYNAMIC_OVERLAP_CHAR_PX = 7
-    _OCR_DYNAMIC_OVERLAP_PAD_PX = 8
+    _OCR_DYNAMIC_OVERLAP_BASE_CHARS = 6
+    _OCR_DYNAMIC_OVERLAP_PX_PER_CHAR = 2
     _OCR_TILE_MAX = 16
     _ADDITIVE_LOCK_FRAMES = 3
 
@@ -1543,10 +1543,11 @@ class ListScannerApp(ctk.CTk):
         if longest <= 0:
             return configured
 
-        estimated = int(longest * self._OCR_DYNAMIC_OVERLAP_CHAR_PX + self._OCR_DYNAMIC_OVERLAP_PAD_PX)
+        extra_chars = max(0, longest - self._OCR_DYNAMIC_OVERLAP_BASE_CHARS)
+        estimated = configured + (extra_chars * self._OCR_DYNAMIC_OVERLAP_PX_PER_CHAR)
         # Keep overlap below target tile size to avoid degenerate step size.
         max_safe_overlap = max(0, int(self._ocr_tile_target_px) - 1)
-        return min(max(configured, estimated), max_safe_overlap)
+        return min(estimated, max_safe_overlap)
 
     def _close_debug_win(self):
         """Close the debug window and reset tracking state."""
