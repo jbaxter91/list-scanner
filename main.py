@@ -88,7 +88,7 @@ class _GlobalWheelHook:
 
     class MSLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
-            ("pt", POINT),
+            ("pt", ctypes.wintypes.POINT),
             ("mouseData", ctypes.wintypes.DWORD),
             ("flags", ctypes.wintypes.DWORD),
             ("time", ctypes.wintypes.DWORD),
