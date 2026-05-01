@@ -268,7 +268,8 @@ class ListScannerApp(ctk.CTk):
         self._highlight_control_visible = True
         self._show_debug_screenshot = False
         self._show_debug_ocr_frames = False
-        self._ocr_tile_max = self._OCR_TILE_MAX  # user-configurable, persisted to config
+        self._ocr_tile_max = self._OCR_TILE_MAX    # user-configurable, persisted to config
+        self._ocr_tile_min_px = self._OCR_TILE_MIN_PX  # user-configurable, persisted to config
         self._additive_mode = False               # additive scan mode — accumulates evidence per frame
         self._ocr_engine = OcrEngine()
 
@@ -494,6 +495,8 @@ class ListScannerApp(ctk.CTk):
                 self._sync_window_stack()
             if "ocr_tile_max" in data:
                 self._ocr_tile_max = max(1, int(data["ocr_tile_max"]))
+            if "ocr_tile_min_px" in data:
+                self._ocr_tile_min_px = max(1, int(data["ocr_tile_min_px"]))
             self._refresh_start_button()
         except Exception:
             pass
@@ -540,6 +543,7 @@ class ListScannerApp(ctk.CTk):
                 "ctrl_click": self._ctrl_click,
                 "always_on_top": self._always_on_top,
                 "ocr_tile_max": self._ocr_tile_max,
+                "ocr_tile_min_px": self._ocr_tile_min_px,
             }
             self._config_path.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -828,6 +832,25 @@ class ListScannerApp(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
         btn_row += 1
 
+        # Min OCR frame size spinbox
+        min_tile_row = tk.Frame(win, bg="#1a1a1a")
+        min_tile_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            min_tile_row, text="Min OCR frame (px):", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        min_tile_var = tk.IntVar(value=self._ocr_tile_min_px)
+        tk.Spinbox(
+            min_tile_row, from_=50, to=2000, textvariable=min_tile_var, width=5,
+            bg="#2b2b2b", fg="#ffffff", insertbackground="white", relief="flat",
+            buttonbackground="#333333", font=("Consolas", 11),
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            min_tile_row, text="px (smaller = more tiles)", bg="#1a1a1a", fg="#555555",
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(8, 0))
+        btn_row += 1
+
         def save():
             for action, ent in entries.items():
                 val = ent.get().strip().lower()
@@ -836,6 +859,7 @@ class ListScannerApp(ctk.CTk):
             self._ctrl_click = ctrl_var.get()
             self._always_on_top = on_top_var.get()
             self._ocr_tile_max = max(1, max_tile_var.get())
+            self._ocr_tile_min_px = max(1, min_tile_var.get())
             self._sync_window_stack()
             self._apply_hotkeys()
             self._refresh_start_button()
@@ -1383,7 +1407,7 @@ class ListScannerApp(ctk.CTk):
                         scale=_SCALE,
                         digits_only=self._ocr_digits_only,
                         target_px=self._OCR_TILE_TARGET_PX,
-                        min_tile_px=self._OCR_TILE_MIN_PX,
+                        min_tile_px=self._ocr_tile_min_px,
                         overlap_px=self._OCR_TILE_OVERLAP_PX,
                         max_tiles=self._effective_tile_max(),
                     )
