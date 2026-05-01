@@ -72,6 +72,88 @@ ctk.set_default_color_theme("blue")
 _CHROMA = "#020203"
 
 
+class _GlobalWheelHook:
+    """Windows low-level mouse wheel hook (captures wheel + precision touchpad scroll)."""
+
+    WH_MOUSE_LL = 14
+    WM_MOUSEWHEEL = 0x020A
+    WM_MOUSEHWHEEL = 0x020E
+    HC_ACTION = 0
+
+    class POINT(ctypes.Structure):
+        _fields_ = [
+            ("x", ctypes.c_long),
+            ("y", ctypes.c_long),
+        ]
+
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("pt", POINT),
+            ("mouseData", ctypes.wintypes.DWORD),
+            ("flags", ctypes.wintypes.DWORD),
+            ("time", ctypes.wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    def __init__(self, on_scroll):
+        self._on_scroll = on_scroll
+        self._hook = None
+        self._cb = None
+        self._thread = None
+        self._thread_id = 0
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+
+    def _run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+        def low_level_mouse_proc(n_code, w_param, l_param):
+            if n_code == self.HC_ACTION and w_param in (self.WM_MOUSEWHEEL, self.WM_MOUSEHWHEEL):
+                try:
+                    self._on_scroll()
+                except Exception:
+                    pass
+            return user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
+
+        self._cb = HOOKPROC(low_level_mouse_proc)
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._hook = user32.SetWindowsHookExW(self.WH_MOUSE_LL, self._cb, kernel32.GetModuleHandleW(None), 0)
+        if not self._hook:
+            self._running = False
+            return
+
+        msg = ctypes.wintypes.MSG()
+        while self._running and user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._hook:
+            user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+        self._thread_id = 0
+        self._running = False
+
+
 
 
 # =============================================================================
@@ -933,6 +1015,17 @@ class ListScannerApp(ctk.CTk):
         self._mouse_listener.daemon = True
         self._mouse_listener.start()
 
+        # Backup wheel hook for precision trackpads that may not emit pynput scroll events.
+        self._wheel_hook = None
+        if sys.platform == "win32":
+            try:
+                self._wheel_hook = _GlobalWheelHook(
+                    on_scroll=lambda: self.after(0, self._reset_votes) if self._scanning else None
+                )
+                self._wheel_hook.start()
+            except Exception:
+                self._wheel_hook = None
+
     def _reset_item_for_input(self, idx: int, item: dict, preserve_locked_additive: bool) -> bool:
         """Reset one row for a click/scroll event. Returns True when a locked additive row was kept."""
         item["votes"].clear()
@@ -1597,6 +1690,12 @@ class ListScannerApp(ctk.CTk):
                 self._mouse_listener.stop()
             except Exception:
                 pass
+        if hasattr(self, "_wheel_hook") and self._wheel_hook is not None:
+            try:
+                self._wheel_hook.stop()
+            except Exception:
+                pass
+            self._wheel_hook = None
         self._save_config()
         self._close_config_win()
         self._close_debug_win()
