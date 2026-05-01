@@ -270,6 +270,7 @@ class ListScannerApp(ctk.CTk):
         self._show_debug_ocr_frames = False
         self._ocr_tile_max = self._OCR_TILE_MAX    # user-configurable, persisted to config
         self._ocr_tile_target_px = self._OCR_TILE_TARGET_PX  # user-configurable, persisted to config
+        self._ocr_tile_overlap_px = self._OCR_TILE_OVERLAP_PX  # user-configurable, persisted to config
         self._additive_mode = False               # additive scan mode — accumulates evidence per frame
         self._ocr_engine = OcrEngine()
 
@@ -499,6 +500,8 @@ class ListScannerApp(ctk.CTk):
                 self._ocr_tile_target_px = max(1, int(data["ocr_tile_min_px"]))
             if "ocr_tile_target_px" in data:
                 self._ocr_tile_target_px = max(1, int(data["ocr_tile_target_px"]))
+            if "ocr_tile_overlap_px" in data:
+                self._ocr_tile_overlap_px = max(0, int(data["ocr_tile_overlap_px"]))
             self._refresh_start_button()
         except Exception:
             pass
@@ -546,6 +549,7 @@ class ListScannerApp(ctk.CTk):
                 "always_on_top": self._always_on_top,
                 "ocr_tile_max": self._ocr_tile_max,
                 "ocr_tile_target_px": self._ocr_tile_target_px,
+                "ocr_tile_overlap_px": self._ocr_tile_overlap_px,
             }
             self._config_path.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -853,6 +857,25 @@ class ListScannerApp(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
         btn_row += 1
 
+        # OCR frame overlap spinbox
+        overlap_row = tk.Frame(win, bg="#1a1a1a")
+        overlap_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            overlap_row, text="OCR frame overlap (px):", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        overlap_var = tk.IntVar(value=self._ocr_tile_overlap_px)
+        tk.Spinbox(
+            overlap_row, from_=0, to=500, textvariable=overlap_var, width=5,
+            bg="#2b2b2b", fg="#ffffff", insertbackground="white", relief="flat",
+            buttonbackground="#333333", font=("Consolas", 11),
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            overlap_row, text="px (helps text near tile edges)", bg="#1a1a1a", fg="#555555",
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(8, 0))
+        btn_row += 1
+
         def save():
             for action, ent in entries.items():
                 val = ent.get().strip().lower()
@@ -862,6 +885,7 @@ class ListScannerApp(ctk.CTk):
             self._always_on_top = on_top_var.get()
             self._ocr_tile_max = max(1, max_tile_var.get())
             self._ocr_tile_target_px = max(1, min_tile_var.get())
+            self._ocr_tile_overlap_px = max(0, overlap_var.get())
             self._sync_window_stack()
             self._apply_hotkeys()
             self._refresh_start_button()
@@ -1247,8 +1271,8 @@ class ListScannerApp(ctk.CTk):
             f"Scanning started: items={len(self._items)}, area={area['width']}x{area['height']} "
             f"at ({area['left']},{area['top']}), scale={self._ocr_scale:.1f}x, "
             f"ocr_mode={'digits-only' if self._ocr_digits_only else 'general'}, lang=eng, "
-            f"adaptive_tiles=target{self._OCR_TILE_TARGET_PX}px/min{self._OCR_TILE_MIN_PX}px/"
-            f"overlap{self._OCR_TILE_OVERLAP_PX}px/max{self._OCR_TILE_MAX}, "
+            f"adaptive_tiles=target{self._ocr_tile_target_px}px/min{self._OCR_TILE_MIN_PX}px/"
+            f"overlap{self._ocr_tile_overlap_px}px/max{self._ocr_tile_max}, "
             f"overlay={'on' if self._show_overlay else 'off'}, screenshot_preview="
             f"{'on' if self._show_debug_screenshot else 'off'}",
             "info",
@@ -1410,7 +1434,7 @@ class ListScannerApp(ctk.CTk):
                         digits_only=self._ocr_digits_only,
                         target_px=self._ocr_tile_target_px,
                         min_tile_px=self._OCR_TILE_MIN_PX,
-                        overlap_px=self._OCR_TILE_OVERLAP_PX,
+                        overlap_px=self._ocr_tile_overlap_px,
                         max_tiles=self._effective_tile_max(),
                     )
                     prepared_ocr = pass_result.prepared_ocr
