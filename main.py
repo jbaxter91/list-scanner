@@ -244,7 +244,7 @@ class ListScannerApp(ctk.CTk):
     _OCR_TILE_MIN_PX = 250
     _OCR_TILE_OVERLAP_PX = 30
     _OCR_TILE_MAX = 16
-    _ADDITIVE_LOCK_FRAMES = 4
+    _ADDITIVE_LOCK_FRAMES = 3
 
     def __init__(self):
         super().__init__()
