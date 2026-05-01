@@ -1027,12 +1027,12 @@ class ListScannerApp(ctk.CTk):
 
     def _start_mouse_listener(self):
         def on_click(x, y, button, pressed):
-            if self._scanning:
-                self.after(0, self._reset_votes)
+            if pressed and self._scanning:
+                self._queue_input_reset("mouse_click")
 
         def on_scroll(x, y, dx, dy):
             if self._scanning:
-                self.after(0, self._reset_votes)
+                self._queue_input_reset("mouse_wheel")
 
         self._mouse_listener = _pynput_mouse.Listener(
             on_click=on_click, on_scroll=on_scroll
@@ -1042,7 +1042,7 @@ class ListScannerApp(ctk.CTk):
 
         def on_tk_scroll(_event):
             if self._scanning:
-                self._reset_votes()
+                self._queue_input_reset("tk_wheel")
 
         # Fallback path for trackpad gestures delivered to the app window.
         self.bind_all("<MouseWheel>", on_tk_scroll, add="+")
@@ -1053,12 +1053,18 @@ class ListScannerApp(ctk.CTk):
         if sys.platform == "win32":
             try:
                 self._wheel_hook = _GlobalWheelHook(
-                    on_scroll=lambda: self.after(0, self._reset_votes) if self._scanning else None
+                    on_scroll=lambda: self._queue_input_reset("trackpad_hook") if self._scanning else None
                 )
                 if not self._wheel_hook.start():
+                    self._debug_event("Trackpad wheel hook failed to start; using tk/pynput fallbacks", "warn")
                     self._wheel_hook = None
             except Exception:
+                self._debug_event("Trackpad wheel hook failed to initialize; using tk/pynput fallbacks", "warn")
                 self._wheel_hook = None
+
+    def _queue_input_reset(self, source: str):
+        """Schedule a vote reset and include the trigger source in debug output."""
+        self.after(0, self._reset_votes, source)
 
     def _reset_item_for_input(self, idx: int, item: dict, preserve_locked_additive: bool) -> bool:
         """Reset one row for a click/scroll event. Returns True when a locked additive row was kept."""
@@ -1080,7 +1086,7 @@ class ListScannerApp(ctk.CTk):
             self._update_row_additive(idx, 0, False)
         return False
 
-    def _reset_votes(self):
+    def _reset_votes(self, source: str = "input"):
         """Clear all vote histories and hide overlay — called on mouse interaction."""
         self._scan_gen += 1  # invalidate any in-flight scan results
 
@@ -1092,7 +1098,7 @@ class ListScannerApp(ctk.CTk):
 
             self._overlay.hide()
             self._debug_event(
-                f"Votes reset; generation={self._scan_gen}; additive_locked_preserved={locked_count}",
+                f"Votes reset ({source}); generation={self._scan_gen}; additive_locked_preserved={locked_count}",
                 "info",
             )
             return
@@ -1102,7 +1108,7 @@ class ListScannerApp(ctk.CTk):
         self._restore_item_texts()
         self._reset_colors()
         self._overlay.hide()
-        self._debug_event(f"Votes reset; generation={self._scan_gen}", "info")
+        self._debug_event(f"Votes reset ({source}); generation={self._scan_gen}", "info")
 
     # ── Debug panel ───────────────────────────────────────────────────────────
 
