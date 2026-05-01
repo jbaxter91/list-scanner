@@ -299,9 +299,11 @@ class _RawInputWheelSink:
     WM_CLOSE = 0x0010
     RID_INPUT = 0x10000003
     RIM_TYPEMOUSE = 0
+    RIM_TYPEHID = 2
     RI_MOUSE_WHEEL = 0x0400
     RI_MOUSE_HWHEEL = 0x0800
     RIDEV_INPUTSINK = 0x00000100
+    RIDEV_DEVNOTIFY = 0x00002000
     HWND_MESSAGE = ctypes.c_void_p(-3).value
 
     class RAWINPUTDEVICE(ctypes.Structure):
@@ -344,8 +346,9 @@ class _RawInputWheelSink:
             ("lpszClassName", ctypes.wintypes.LPCWSTR),
         ]
 
-    def __init__(self, on_scroll):
+    def __init__(self, on_scroll, on_touchpad_activity=None):
         self._on_scroll = on_scroll
+        self._on_touchpad_activity = on_touchpad_activity
         self._thread = None
         self._thread_id = 0
         self._running = False
@@ -441,6 +444,11 @@ class _RawInputWheelSink:
                                     self._on_scroll()
                                 except Exception:
                                     pass
+                        elif header.dwType == self.RIM_TYPEHID and self._on_touchpad_activity is not None:
+                            try:
+                                self._on_touchpad_activity()
+                            except Exception:
+                                pass
                 return 0
             if msg == self.WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -480,13 +488,21 @@ class _RawInputWheelSink:
             self._running = False
             return
 
-        rid = self.RAWINPUTDEVICE(
-            usUsagePage=0x01,  # Generic desktop controls
-            usUsage=0x02,      # Mouse
-            dwFlags=self.RIDEV_INPUTSINK,
-            hwndTarget=self._hwnd,
+        rid = (self.RAWINPUTDEVICE * 2)(
+            self.RAWINPUTDEVICE(
+                usUsagePage=0x01,  # Generic desktop controls
+                usUsage=0x02,      # Mouse
+                dwFlags=self.RIDEV_INPUTSINK | self.RIDEV_DEVNOTIFY,
+                hwndTarget=self._hwnd,
+            ),
+            self.RAWINPUTDEVICE(
+                usUsagePage=0x0D,  # Digitizers
+                usUsage=0x05,      # Touchpad (Windows Precision Touchpad TLC)
+                dwFlags=self.RIDEV_INPUTSINK | self.RIDEV_DEVNOTIFY,
+                hwndTarget=self._hwnd,
+            ),
         )
-        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(self.RAWINPUTDEVICE)):
+        if not user32.RegisterRawInputDevices(ctypes.byref(rid), 2, ctypes.sizeof(self.RAWINPUTDEVICE)):
             self._started_evt.set()
             self._running = False
             return
@@ -1411,7 +1427,8 @@ class ListScannerApp(ctk.CTk):
         if sys.platform == "win32":
             try:
                 self._raw_input_hook = _RawInputWheelSink(
-                    on_scroll=lambda: self._queue_input_reset("raw_input_wheel") if self._scanning else None
+                    on_scroll=lambda: self._queue_input_reset("raw_input_wheel") if self._scanning else None,
+                    on_touchpad_activity=lambda: self._queue_input_reset("raw_input_touchpad") if self._scanning else None,
                 )
                 if not self._raw_input_hook.start():
                     self._debug_event("Raw input wheel hook failed to start", "warn")
