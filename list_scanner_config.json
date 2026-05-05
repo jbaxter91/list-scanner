@@ -1,9 +1,9 @@
 {
   "scan_area": {
-    "left": 3405,
-    "top": 182,
-    "width": 179,
-    "height": 517
+    "left": 3392,
+    "top": 169,
+    "width": 182,
+    "height": 519
   },
   "hotkeys": {
     "start_stop": "f12",
@@ -19,5 +19,7 @@
   "ocr_tile_max": 64,
   "ocr_tile_target_px": 400,
   "ocr_tile_overlap_px": 30,
-  "opacity": 97
+  "opacity": 97,
+  "box_color": "#da0cda",
+  "box_width": 4
 }

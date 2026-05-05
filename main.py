@@ -780,7 +780,7 @@ class HighlightOverlay:
         self._canvas: tk.Canvas | None = None
         self._current_area: dict | None = None
 
-    def show(self, scan_area: dict, boxes: list[tuple]):
+    def show(self, scan_area: dict, boxes: list[tuple], color: str = "#00e676", line_width: int = 2):
         if not boxes:
             # No hits — clear canvas but leave the window open to avoid flash
             if self._canvas:
@@ -826,10 +826,11 @@ class HighlightOverlay:
 
         # Redraw boxes in place — no window destroy/recreate
         self._canvas.delete("all")
+        pad = max(1, line_width + 1)
         for (x, y, w, h) in boxes:
             self._canvas.create_rectangle(
-                x - 3, y - 3, x + w + 3, y + h + 3,
-                outline="#00e676", width=2,
+                x - pad, y - pad, x + w + pad, y + h + pad,
+                outline=color, width=line_width,
             )
 
     def hide(self):
@@ -890,6 +891,8 @@ class ListScannerApp(ctk.CTk):
         self._ocr_tile_max = self._OCR_TILE_MAX    # user-configurable, persisted to config
         self._ocr_tile_target_px = self._OCR_TILE_TARGET_PX  # user-configurable, persisted to config
         self._ocr_tile_overlap_px = self._OCR_TILE_OVERLAP_PX  # user-configurable, persisted to config
+        self._box_color = "#00e676"               # overlay highlight box color
+        self._box_width = 2                       # overlay highlight box line width (px)
         self._additive_mode = False               # additive scan mode — accumulates evidence per frame
         self._ocr_engine = OcrEngine()
 
@@ -1138,6 +1141,12 @@ class ListScannerApp(ctk.CTk):
                 self._ocr_tile_target_px = max(1, int(data["ocr_tile_target_px"]))
             if "ocr_tile_overlap_px" in data:
                 self._ocr_tile_overlap_px = max(0, int(data["ocr_tile_overlap_px"]))
+            if "box_color" in data:
+                c = str(data["box_color"]).strip()
+                if c.startswith("#") and len(c) in (4, 7):
+                    self._box_color = c
+            if "box_width" in data:
+                self._box_width = max(1, min(20, int(data["box_width"])))
             self._refresh_start_button()
         except Exception:
             pass
@@ -1188,6 +1197,8 @@ class ListScannerApp(ctk.CTk):
                 "ocr_tile_target_px": self._ocr_tile_target_px,
                 "ocr_tile_overlap_px": self._ocr_tile_overlap_px,
                 "opacity": self._opacity,
+                "box_color": self._box_color,
+                "box_width": self._box_width,
             }
             self._config_path.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -1537,6 +1548,68 @@ class ListScannerApp(ctk.CTk):
         opacity_val_lbl.pack(side="left")
         btn_row += 1
 
+        # Highlight box color picker
+        box_color_row = tk.Frame(win, bg="#1a1a1a")
+        box_color_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            box_color_row, text="Highlight box color:", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        box_color_var = tk.StringVar(value=self._box_color)
+        box_color_preview = tk.Label(
+            box_color_row, bg=self._box_color, width=3, relief="flat",
+        )
+        box_color_preview.pack(side="left", padx=(8, 4))
+        box_color_entry = tk.Entry(
+            box_color_row, textvariable=box_color_var,
+            bg="#2b2b2b", fg="#ffffff", insertbackground="white",
+            font=("Consolas", 11), width=8, relief="flat",
+        )
+        box_color_entry.pack(side="left", padx=(0, 4))
+
+        def _pick_color(var=box_color_var, preview=box_color_preview):
+            from tkinter import colorchooser
+            initial = var.get() if var.get().startswith("#") else "#00e676"
+            result = colorchooser.askcolor(color=initial, title="Pick highlight color", parent=win)
+            if result and result[1]:
+                var.set(result[1])
+                preview.configure(bg=result[1])
+
+        def _on_color_entry_change(*_, var=box_color_var, preview=box_color_preview):
+            val = var.get().strip()
+            if val.startswith("#") and len(val) in (4, 7):
+                try:
+                    preview.configure(bg=val)
+                except tk.TclError:
+                    pass
+
+        box_color_var.trace_add("write", _on_color_entry_change)
+        tk.Button(
+            box_color_row, text="…", command=_pick_color,
+            bg="#333333", fg="white", relief="flat",
+            font=("Segoe UI", 10), padx=6, pady=2, cursor="hand2",
+        ).pack(side="left")
+        btn_row += 1
+
+        # Highlight box line width
+        box_width_row = tk.Frame(win, bg="#1a1a1a")
+        box_width_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            box_width_row, text="Highlight box width:", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        box_width_var = tk.IntVar(value=self._box_width)
+        tk.Spinbox(
+            box_width_row, from_=1, to=20, textvariable=box_width_var, width=3,
+            bg="#2b2b2b", fg="#ffffff", insertbackground="white", relief="flat",
+            buttonbackground="#333333", font=("Consolas", 11),
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            box_width_row, text="px", bg="#1a1a1a", fg="#555555",
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(4, 0))
+        btn_row += 1
+
         def save():
             for action, ent in entries.items():
                 val = ent.get().strip().lower()
@@ -1548,6 +1621,10 @@ class ListScannerApp(ctk.CTk):
             self._ocr_tile_target_px = max(1, min_tile_var.get())
             self._ocr_tile_overlap_px = max(0, overlap_var.get())
             self._opacity = max(20, min(100, opacity_var.get()))
+            c = box_color_var.get().strip()
+            if c.startswith("#") and len(c) in (4, 7):
+                self._box_color = c
+            self._box_width = max(1, min(20, box_width_var.get()))
             self._sync_window_stack()
             self._apply_hotkeys()
             self._refresh_start_button()
@@ -2238,8 +2315,8 @@ class ListScannerApp(ctk.CTk):
                     continue
                 self.after(0, self._set_status, f"Scanning…  {found_count}/{total} found")
                 if self._show_overlay:
-                    self.after(0, lambda a=area, b=all_boxes, g=gen:
-                        self._overlay.show(a, b) if self._scan_gen == g else None)
+                    self.after(0, lambda a=area, b=all_boxes, g=gen, c=self._box_color, lw=self._box_width:
+                        self._overlay.show(a, b, c, lw) if self._scan_gen == g else None)
                 self.after(
                     0,
                     self._debug_event,
