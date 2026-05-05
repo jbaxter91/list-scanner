@@ -1,9 +1,9 @@
 {
   "scan_area": {
-    "left": 3392,
-    "top": 169,
-    "width": 182,
-    "height": 519
+    "left": 284,
+    "top": 255,
+    "width": 2133,
+    "height": 1205
   },
   "hotkeys": {
     "start_stop": "f12",
@@ -13,7 +13,7 @@
     "click_found": "f8",
     "toggle_additive": "f7"
   },
-  "ocr_scale": 3.1,
+  "ocr_scale": 2.0,
   "ctrl_click": true,
   "always_on_top": true,
   "ocr_tile_max": 64,

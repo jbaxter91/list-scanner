@@ -769,9 +769,18 @@ class ScanAreaSelector:
 
 class HighlightOverlay:
     """
-    Transparent always-on-top window that draws green boxes around
+    Transparent always-on-top window that draws coloured boxes around
     found text positions within the scan area.
-    The window is created once and reused; only the canvas contents are redrawn.
+
+    The window is created once and kept alive for the lifetime of the scan —
+    only the canvas contents are replaced.  We never destroy/recreate the
+    window mid-scan because that causes the visible flicker.
+
+    WDA_EXCLUDEFROMCAPTURE (0x11) is set synchronously on the HWND immediately
+    after the window is mapped, which tells DWM to exclude it from every
+    subsequent BitBlt / DWM-based screen-grab.  ImageGrab.grab(all_screens=True)
+    uses the DWM path on Windows 10 v2004+ so the overlay is invisible to OCR
+    without ever hiding the window.
     """
 
     def __init__(self, root: tk.Misc):
@@ -779,42 +788,57 @@ class HighlightOverlay:
         self._win: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
         self._current_area: dict | None = None
+        self._capture_excluded = False   # track whether WDA flag was successfully set
 
-    def show(self, scan_area: dict, boxes: list[tuple], color: str = "#00e676", line_width: int = 2):
-        if not boxes:
-            # No hits — clear canvas but leave the window open to avoid flash
-            if self._canvas:
-                self._canvas.delete("all")
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_window(self, scan_area: dict):
+        """Create the overlay window if it doesn't exist yet."""
+        if self._win is not None:
             return
+        win = tk.Toplevel(self._root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-transparentcolor", _CHROMA)
+        win.configure(bg=_CHROMA)
+        win.geometry(
+            f"{scan_area['width']}x{scan_area['height']}"
+            f"+{scan_area['left']}+{scan_area['top']}"
+        )
+        # Force the window to be fully mapped before grabbing its HWND,
+        # otherwise winfo_id() may return a stale handle on some drivers.
+        win.update_idletasks()
 
-        # Create window once, or reposition if the scan area changed
-        if self._win is None:
-            self._win = tk.Toplevel(self._root)
-            self._win.overrideredirect(True)
-            self._win.attributes("-topmost", True)
-            self._win.attributes("-transparentcolor", _CHROMA)
-            self._win.configure(bg=_CHROMA)
-            self._win.geometry(
-                f"{scan_area['width']}x{scan_area['height']}"
-                f"+{scan_area['left']}+{scan_area['top']}"
-            )
-            # Exclude the overlay from screen capture so OCR is never affected.
-            # WDA_EXCLUDEFROMCAPTURE = 0x11 (Windows 10 v2004+)
-            try:
-                hwnd = self._win.winfo_id()
-                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
-            except Exception:
-                pass
-            self._canvas = tk.Canvas(
-                self._win,
-                width=scan_area["width"],
-                height=scan_area["height"],
-                bg=_CHROMA,
-                highlightthickness=0,
-            )
-            self._canvas.pack()
-            self._current_area = scan_area
-        elif scan_area != self._current_area:
+        # Exclude from all screen captures (DWM BitBlt path, Windows 10 v2004+).
+        # WDA_EXCLUDEFROMCAPTURE = 0x00000011
+        # IMPORTANT: winfo_id() returns a WS_CHILD sub-frame HWND, not the real
+        # top-level window. SetWindowDisplayAffinity requires the top-level HWND,
+        # which we get via GetAncestor(hwnd, GA_ROOT=2). Using the child HWND
+        # causes ERROR_INVALID_PARAMETER (87) and the flag silently has no effect.
+        try:
+            child_hwnd = win.winfo_id()
+            real_hwnd = ctypes.windll.user32.GetAncestor(child_hwnd, 2)  # GA_ROOT = 2
+            result = ctypes.windll.user32.SetWindowDisplayAffinity(real_hwnd, 0x00000011)
+            self._capture_excluded = bool(result)
+        except Exception:
+            self._capture_excluded = False
+
+        canvas = tk.Canvas(
+            win,
+            width=scan_area["width"],
+            height=scan_area["height"],
+            bg=_CHROMA,
+            highlightthickness=0,
+        )
+        canvas.pack()
+        self._win = win
+        self._canvas = canvas
+        self._current_area = scan_area
+
+    def _reposition_if_needed(self, scan_area: dict):
+        if scan_area != self._current_area:
             self._win.geometry(
                 f"{scan_area['width']}x{scan_area['height']}"
                 f"+{scan_area['left']}+{scan_area['top']}"
@@ -824,8 +848,18 @@ class HighlightOverlay:
             )
             self._current_area = scan_area
 
-        # Redraw boxes in place — no window destroy/recreate
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def show(self, scan_area: dict, boxes: list[tuple], color: str = "#00e676", line_width: int = 2):
+        self._ensure_window(scan_area)
+        self._reposition_if_needed(scan_area)
+
         self._canvas.delete("all")
+        if not boxes:
+            return
+
         pad = max(1, line_width + 1)
         for (x, y, w, h) in boxes:
             self._canvas.create_rectangle(
@@ -833,7 +867,13 @@ class HighlightOverlay:
                 outline=color, width=line_width,
             )
 
+    def clear(self):
+        """Remove all drawn boxes without hiding the window."""
+        if self._canvas:
+            self._canvas.delete("all")
+
     def hide(self):
+        """Permanently destroy the overlay (called on stop/shutdown)."""
         self._destroy()
 
     def _destroy(self):
@@ -845,6 +885,7 @@ class HighlightOverlay:
             self._win = None
             self._canvas = None
             self._current_area = None
+            self._capture_excluded = False
 
 
 # =============================================================================
@@ -1072,7 +1113,7 @@ class ListScannerApp(ctk.CTk):
     def _toggle_overlay(self):
         self._show_overlay = bool(self._overlay_toggle.get())
         if not self._show_overlay:
-            self._overlay.hide()
+            self._overlay.clear()
 
     def _on_window_configure(self, event):
         if event.widget is self:
@@ -1756,7 +1797,7 @@ class ListScannerApp(ctk.CTk):
                 if self._reset_item_for_input(i, item, preserve_locked_additive=True):
                     locked_count += 1
 
-            self._overlay.hide()
+            self._overlay.clear()
             self._debug_event(
                 f"Votes reset ({source}); generation={self._scan_gen}; additive_locked_preserved={locked_count}",
                 "info",
@@ -1767,7 +1808,7 @@ class ListScannerApp(ctk.CTk):
             self._reset_item_for_input(i, item, preserve_locked_additive=False)
         self._restore_item_texts()
         self._reset_colors()
-        self._overlay.hide()
+        self._overlay.clear()
         self._debug_event(f"Votes reset ({source}); generation={self._scan_gen}", "info")
 
     # ── Debug panel ───────────────────────────────────────────────────────────
@@ -2204,13 +2245,10 @@ class ListScannerApp(ctk.CTk):
                     "info",
                 )
 
-                # Hide overlay just for the capture to avoid OCR reading its own boxes.
-                hide_done = threading.Event()
-                self.after(0, lambda e=hide_done: (self._overlay.hide(), e.set()))
-                hide_done.wait(timeout=0.3)
-
                 # ImageGrab.grab with all_screens=True handles cross-monitor regions
                 # correctly via DWM, unlike mss which uses a per-monitor DC.
+                # The overlay window is excluded from DWM capture via WDA_EXCLUDEFROMCAPTURE
+                # (set at window creation), so we never need to hide it before grabbing.
                 bbox = (
                     area["left"],
                     area["top"],
@@ -2219,8 +2257,6 @@ class ListScannerApp(ctk.CTk):
                 )
                 orig_img = ImageGrab.grab(bbox=bbox, all_screens=True)
                 grab_ms = (time.perf_counter() - pass_start) * 1000
-
-                # Keep overlay hidden until current-pass OCR completes to avoid ghost boxes.
 
                 # If a reset happened during the grab/OCR, discard this scan entirely
                 if self._scan_gen != gen:
