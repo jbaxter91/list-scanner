@@ -1,19 +1,23 @@
 {
   "scan_area": {
-    "left": 263,
-    "top": 192,
-    "width": 2249,
-    "height": 1294
+    "left": 3405,
+    "top": 182,
+    "width": 179,
+    "height": 517
   },
   "hotkeys": {
     "start_stop": "f12",
     "toggle_overlay": "f11",
     "toggle_debug": "f9",
     "set_area": "f10",
-    "click_found": "f8"
+    "click_found": "f8",
+    "toggle_additive": "f7"
   },
-  "ocr_scale": 1.3,
+  "ocr_scale": 3.1,
   "ctrl_click": true,
   "always_on_top": true,
-  "ocr_tile_max": 20
+  "ocr_tile_max": 64,
+  "ocr_tile_target_px": 400,
+  "ocr_tile_overlap_px": 30,
+  "opacity": 97
 }

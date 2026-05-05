@@ -26,7 +26,6 @@ class OcrEngine:
         self,
         gray: Image.Image,
         scale: float,
-        digits_only: bool,
         target_px: int,
         min_tile_px: int,
         overlap_x_px: int,
@@ -38,8 +37,6 @@ class OcrEngine:
         # --oem 1: LSTM engine only (fastest accurate mode)
         # --psm 11: sparse text - finds words anywhere on the page
         ocr_config = "--oem 1 --psm 11"
-        if digits_only:
-            ocr_config += " -c tessedit_char_whitelist=0123456789"
 
         w, h = gray.size
         cols, rows, tiles = self.build_adaptive_tiles(
@@ -269,11 +266,6 @@ def preprocess_search_term(search: str) -> dict:
         "query": query,
         "sep_query": sep_query,
     }
-
-
-def is_numeric_item(text: str) -> bool:
-    compact = "".join(ch for ch in text.strip() if not ch.isspace())
-    return bool(compact) and compact.isdigit()
 
 
 def locate_prepared(search: str, prepared: dict, search_prep: dict | None = None) -> list[tuple]:

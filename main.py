@@ -14,6 +14,7 @@ import ctypes.wintypes
 import json
 import threading
 import time
+import struct
 import tkinter as tk
 from collections import deque
 from pathlib import Path
@@ -29,7 +30,6 @@ from ocr_engine import (
     OcrEngine,
     locate_prepared as _locate_prepared,
     preprocess_search_term as _preprocess_search_term,
-    is_numeric_item as _is_numeric_item,
 )
 
 # ── DPI awareness (must be before any window creation) ────────────────────────
@@ -298,6 +298,7 @@ class _RawInputWheelSink:
     WM_INPUT = 0x00FF
     WM_CLOSE = 0x0010
     RID_INPUT = 0x10000003
+    RIDI_PREPARSEDDATA = 0x20000005
     RIM_TYPEMOUSE = 0
     RIM_TYPEHID = 2
     RI_MOUSE_WHEEL = 0x0400
@@ -305,6 +306,11 @@ class _RawInputWheelSink:
     RIDEV_INPUTSINK = 0x00000100
     RIDEV_DEVNOTIFY = 0x00002000
     HWND_MESSAGE = ctypes.c_void_p(-3).value
+    HIDP_INPUT = 0
+    HIDP_STATUS_SUCCESS = 0x00110000
+    HID_USAGE_PAGE_DIGITIZER = 0x0D
+    HID_USAGE_CONTACT_COUNT = 0x54
+    HID_SCROLL_DEBOUNCE_SEC = 0.10
 
     class RAWINPUTDEVICE(ctypes.Structure):
         _fields_ = [
@@ -346,9 +352,29 @@ class _RawInputWheelSink:
             ("lpszClassName", ctypes.wintypes.LPCWSTR),
         ]
 
-    def __init__(self, on_scroll, on_touchpad_activity=None):
+    class HIDP_CAPS(ctypes.Structure):
+        _fields_ = [
+            ("Usage", ctypes.wintypes.USHORT),
+            ("UsagePage", ctypes.wintypes.USHORT),
+            ("InputReportByteLength", ctypes.wintypes.USHORT),
+            ("OutputReportByteLength", ctypes.wintypes.USHORT),
+            ("FeatureReportByteLength", ctypes.wintypes.USHORT),
+            ("Reserved", ctypes.wintypes.USHORT * 17),
+            ("NumberLinkCollectionNodes", ctypes.wintypes.USHORT),
+            ("NumberInputButtonCaps", ctypes.wintypes.USHORT),
+            ("NumberInputValueCaps", ctypes.wintypes.USHORT),
+            ("NumberInputDataIndices", ctypes.wintypes.USHORT),
+            ("NumberOutputButtonCaps", ctypes.wintypes.USHORT),
+            ("NumberOutputValueCaps", ctypes.wintypes.USHORT),
+            ("NumberOutputDataIndices", ctypes.wintypes.USHORT),
+            ("NumberFeatureButtonCaps", ctypes.wintypes.USHORT),
+            ("NumberFeatureValueCaps", ctypes.wintypes.USHORT),
+            ("NumberFeatureDataIndices", ctypes.wintypes.USHORT),
+        ]
+
+    def __init__(self, on_scroll, on_touchpad_scroll=None):
         self._on_scroll = on_scroll
-        self._on_touchpad_activity = on_touchpad_activity
+        self._on_touchpad_scroll = on_touchpad_scroll
         self._thread = None
         self._thread_id = 0
         self._running = False
@@ -357,6 +383,63 @@ class _RawInputWheelSink:
         self._hwnd = None
         self._class_name = None
         self._wndproc = None
+        self._hid_last_scroll_ts = 0.0
+        self._hid_preparsed_cache: dict[int, ctypes.Array] = {}
+
+    def _get_hid_preparsed(self, user32, h_device):
+        key = int(ctypes.cast(h_device, ctypes.c_void_p).value or 0)
+        if not key:
+            return None
+        cached = self._hid_preparsed_cache.get(key)
+        if cached is not None:
+            return cached
+
+        size = ctypes.wintypes.UINT(0)
+        user32.GetRawInputDeviceInfoW(h_device, self.RIDI_PREPARSEDDATA, None, ctypes.byref(size))
+        if not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        got = user32.GetRawInputDeviceInfoW(
+            h_device,
+            self.RIDI_PREPARSEDDATA,
+            ctypes.byref(buf),
+            ctypes.byref(size),
+        )
+        if got == 0xFFFFFFFF or got == 0:
+            return None
+        self._hid_preparsed_cache[key] = buf
+        return buf
+
+    def _hid_report_contact_count(self, user32, hid, h_device, report_ptr, report_len):
+        preparsed = self._get_hid_preparsed(user32, h_device)
+        if preparsed is None:
+            return None
+
+        caps = self.HIDP_CAPS()
+        caps_status = hid.HidP_GetCaps(ctypes.byref(preparsed), ctypes.byref(caps))
+        if caps_status != self.HIDP_STATUS_SUCCESS:
+            return None
+
+        # Prefer device-declared usage page when available; fall back to digitizer page.
+        usage_pages = [caps.UsagePage]
+        if caps.UsagePage != self.HID_USAGE_PAGE_DIGITIZER:
+            usage_pages.append(self.HID_USAGE_PAGE_DIGITIZER)
+
+        usage_value = ctypes.wintypes.ULONG(0)
+        for usage_page in usage_pages:
+            status = hid.HidP_GetUsageValue(
+                self.HIDP_INPUT,
+                usage_page,
+                0,
+                self.HID_USAGE_CONTACT_COUNT,
+                ctypes.byref(usage_value),
+                ctypes.byref(preparsed),
+                ctypes.cast(report_ptr, ctypes.c_char_p),
+                report_len,
+            )
+            if status == self.HIDP_STATUS_SUCCESS:
+                return int(usage_value.value)
+        return None
 
     def start(self):
         if self._running:
@@ -412,11 +495,28 @@ class _RawInputWheelSink:
         user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(self.RAWINPUTDEVICE), ctypes.wintypes.UINT, ctypes.wintypes.UINT]
         user32.GetRawInputData.restype = ctypes.wintypes.UINT
         user32.GetRawInputData.argtypes = [ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.UINT), ctypes.wintypes.UINT]
+        user32.GetRawInputDeviceInfoW.restype = ctypes.wintypes.UINT
+        user32.GetRawInputDeviceInfoW.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.UINT)]
         user32.GetMessageW.restype = ctypes.c_int
         user32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
         kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
         kernel32.GetModuleHandleW.restype = ctypes.c_void_p
         kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+
+        hid = ctypes.windll.hid
+        hid.HidP_GetCaps.restype = ctypes.c_long
+        hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(self.HIDP_CAPS)]
+        hid.HidP_GetUsageValue.restype = ctypes.c_long
+        hid.HidP_GetUsageValue.argtypes = [
+            ctypes.c_int,
+            ctypes.wintypes.USHORT,
+            ctypes.wintypes.USHORT,
+            ctypes.wintypes.USHORT,
+            ctypes.POINTER(ctypes.wintypes.ULONG),
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.wintypes.ULONG,
+        ]
 
         def wnd_proc(hwnd, msg, w_param, l_param):
             if msg == self.WM_INPUT:
@@ -444,11 +544,38 @@ class _RawInputWheelSink:
                                     self._on_scroll()
                                 except Exception:
                                     pass
-                        elif header.dwType == self.RIM_TYPEHID and self._on_touchpad_activity is not None:
-                            try:
-                                self._on_touchpad_activity()
-                            except Exception:
-                                pass
+                        elif header.dwType == self.RIM_TYPEHID and self._on_touchpad_scroll is not None:
+                            raw_off = ctypes.sizeof(self.RAWINPUTHEADER)
+                            if size.value >= raw_off + 8:
+                                try:
+                                    dw_size_hid, dw_count = struct.unpack_from("<II", buf.raw, raw_off)
+                                except Exception:
+                                    dw_size_hid, dw_count = (0, 0)
+
+                                if dw_size_hid > 0 and dw_count > 0:
+                                    data_off = raw_off + 8
+                                    max_data = max(0, size.value - data_off)
+                                    reports = min(dw_count, max_data // dw_size_hid)
+
+                                    for i in range(reports):
+                                        report_off = data_off + (i * dw_size_hid)
+                                        report_ptr = ctypes.c_void_p(ctypes.addressof(buf) + report_off)
+                                        contact_count = self._hid_report_contact_count(
+                                            user32,
+                                            hid,
+                                            header.hDevice,
+                                            report_ptr,
+                                            dw_size_hid,
+                                        )
+                                        if contact_count is not None and contact_count >= 2:
+                                            now = time.perf_counter()
+                                            if (now - self._hid_last_scroll_ts) >= self.HID_SCROLL_DEBOUNCE_SEC:
+                                                self._hid_last_scroll_ts = now
+                                                try:
+                                                    self._on_touchpad_scroll()
+                                                except Exception:
+                                                    pass
+                                            break
                 return 0
             if msg == self.WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -532,8 +659,10 @@ class _RawInputWheelSink:
 class ScanAreaSelector:
     """Full-screen semi-transparent overlay spanning all monitors for drag-to-select."""
 
-    def __init__(self, root: tk.Misc, callback):
+    def __init__(self, root: tk.Misc, callback, cancel_callback=None):
         self._callback = callback
+        self._cancel_callback = cancel_callback
+        self._completed = False
         self._sx = self._sy = 0
         self._rect_id = None
 
@@ -561,7 +690,7 @@ class ScanAreaSelector:
         self._canvas.pack(fill="both", expand=True)
         self._canvas.create_text(
             vw // 2, 40,
-            text="Drag to select the scan area   \u2022   Esc to cancel",
+            text="Drag to select the scan area   \u2022   Click to capture whole monitor   \u2022   Esc to cancel",
             fill="white",
             font=("Segoe UI", 16, "bold"),
         )
@@ -569,7 +698,13 @@ class ScanAreaSelector:
         self._canvas.bind("<ButtonPress-1>", self._press)
         self._canvas.bind("<B1-Motion>", self._drag)
         self._canvas.bind("<ButtonRelease-1>", self._release)
-        self._win.bind("<Escape>", lambda _: self._win.destroy())
+        self._win.bind("<Escape>", self._cancel)
+
+    def _cancel(self, _e=None):
+        self._completed = True
+        self._win.destroy()
+        if callable(self._cancel_callback):
+            self._cancel_callback()
 
     def _press(self, e: tk.Event):
         self._sx, self._sy = e.x, e.y
@@ -589,6 +724,7 @@ class ScanAreaSelector:
         y1 = min(self._sy, e.y)
         x2 = max(self._sx, e.x)
         y2 = max(self._sy, e.y)
+        self._completed = True
         self._win.destroy()
         if (x2 - x1) >= 20 and (y2 - y1) >= 20:
             # Offset by virtual-screen origin for absolute screen coordinates
@@ -597,6 +733,33 @@ class ScanAreaSelector:
                 "top":    y1 + self._vy,
                 "width":  x2 - x1,
                 "height": y2 - y1,
+            })
+        else:
+            # Single click — capture the whole monitor containing the click point
+            abs_x = e.x + self._vx
+            abs_y = e.y + self._vy
+            u32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                             ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+            hmon = u32.MonitorFromPoint(
+                ctypes.wintypes.POINT(abs_x, abs_y), 2  # MONITOR_DEFAULTTONEAREST
+            )
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            u32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+            r = mi.rcMonitor
+            self._callback({
+                "left":   r.left,
+                "top":    r.top,
+                "width":  r.right - r.left,
+                "height": r.bottom - r.top,
             })
 
 
@@ -711,14 +874,16 @@ class ListScannerApp(ctk.CTk):
         self._show_overlay = True
         self._thread: threading.Thread | None = None
         self._overlay = HighlightOverlay(self)
+        self._pre_area_window_geometry: str | None = None
+        self._pre_area_window_state: str = "normal"
 
         self._items: list[dict] = []       # {'text': str, 'status': str}
         self._scan_gen = 0                  # incremented on reset; discards in-flight results
         self._scan_pass = 0
-        self._ocr_scale = 0.9               # screenshot upscale factor
-        self._ocr_digits_only = False       # if all list items are numeric, constrain OCR charset
+        self._ocr_scale = 1.8               # screenshot upscale factor
         self._ctrl_click = False            # whether click_found uses Ctrl+click
         self._always_on_top = False         # keep window above all others
+        self._opacity = 100                # window opacity 20–100 (higher = more solid)
         self._highlight_control_visible = True
         self._show_debug_screenshot = False
         self._show_debug_ocr_frames = False
@@ -845,6 +1010,13 @@ class ListScannerApp(ctk.CTk):
         self._tk_text.tag_configure("pending",   foreground="#a0a0a0", background="")
         self._tk_text.tag_configure("additive",  foreground="#ffcc00", background="#3d2b00")
 
+        # Allow copy/select-all even when the textbox is in disabled (read-only) state.
+        self._tk_text.bind("<Control-c>", lambda e: self._tk_text.event_generate("<<Copy>>"))
+        self._tk_text.bind("<Control-a>", lambda e: (
+            self._tk_text.tag_add("sel", "1.0", "end"),
+            "break"
+        ))
+
         # ── Control bar ──
         ctrl = ctk.CTkFrame(self)
         ctrl.grid(row=2, column=0, padx=20, pady=4, sticky="ew")
@@ -948,6 +1120,16 @@ class ListScannerApp(ctk.CTk):
             if "always_on_top" in data:
                 self._always_on_top = bool(data["always_on_top"])
                 self._sync_window_stack()
+            if "opacity" in data:
+                # Backward compatibility:
+                # old config stored transparency 0..80, new config stores opacity 20..100
+                raw_opacity = int(data["opacity"])
+                if 0 <= raw_opacity <= 80:
+                    self._opacity = 100 - raw_opacity
+                else:
+                    self._opacity = raw_opacity
+                self._opacity = max(20, min(100, self._opacity))
+                self._sync_window_stack()
             if "ocr_tile_max" in data:
                 self._ocr_tile_max = max(1, int(data["ocr_tile_max"]))
             if "ocr_tile_min_px" in data:
@@ -964,6 +1146,7 @@ class ListScannerApp(ctk.CTk):
         if self._closing:
             return
         self.wm_attributes("-topmost", self._always_on_top)
+        self.wm_attributes("-alpha", self._opacity / 100.0)
 
         debug = getattr(self, "_debug_win", None)
         if debug and debug.winfo_exists():
@@ -1004,6 +1187,7 @@ class ListScannerApp(ctk.CTk):
                 "ocr_tile_max": self._ocr_tile_max,
                 "ocr_tile_target_px": self._ocr_tile_target_px,
                 "ocr_tile_overlap_px": self._ocr_tile_overlap_px,
+                "opacity": self._opacity,
             }
             self._config_path.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -1330,6 +1514,29 @@ class ListScannerApp(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
         btn_row += 1
 
+        # Opacity slider
+        opacity_row = tk.Frame(win, bg="#1a1a1a")
+        opacity_row.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(4, 8), sticky="w")
+        tk.Label(
+            opacity_row, text="Window opacity:", bg="#1a1a1a", fg="#cccccc",
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        opacity_var = tk.IntVar(value=self._opacity)
+        opacity_val_lbl = tk.Label(
+            opacity_row, text=f"{self._opacity}%", bg="#1a1a1a", fg="#ffffff",
+            font=("Consolas", 11), width=4,
+        )
+        def _on_opacity_slide(val, lbl=opacity_val_lbl, var=opacity_var):
+            lbl.configure(text=f"{int(float(val))}%")
+        tk.Scale(
+            opacity_row, from_=20, to=100, orient="horizontal", variable=opacity_var,
+            command=_on_opacity_slide,
+            bg="#1a1a1a", fg="#cccccc", troughcolor="#2b2b2b", highlightthickness=0,
+            length=160, showvalue=False, sliderlength=16,
+        ).pack(side="left", padx=(8, 4))
+        opacity_val_lbl.pack(side="left")
+        btn_row += 1
+
         def save():
             for action, ent in entries.items():
                 val = ent.get().strip().lower()
@@ -1340,6 +1547,7 @@ class ListScannerApp(ctk.CTk):
             self._ocr_tile_max = max(1, max_tile_var.get())
             self._ocr_tile_target_px = max(1, min_tile_var.get())
             self._ocr_tile_overlap_px = max(0, overlap_var.get())
+            self._opacity = max(20, min(100, opacity_var.get()))
             self._sync_window_stack()
             self._apply_hotkeys()
             self._refresh_start_button()
@@ -1428,7 +1636,7 @@ class ListScannerApp(ctk.CTk):
             try:
                 self._raw_input_hook = _RawInputWheelSink(
                     on_scroll=lambda: self._queue_input_reset("raw_input_wheel") if self._scanning else None,
-                    on_touchpad_activity=lambda: self._queue_input_reset("raw_input_touchpad") if self._scanning else None,
+                    on_touchpad_scroll=lambda: self._queue_input_reset("raw_input_touchpad_scroll") if self._scanning else None,
                 )
                 if not self._raw_input_hook.start():
                     self._debug_event("Raw input wheel hook failed to start", "warn")
@@ -1692,12 +1900,41 @@ class ListScannerApp(ctk.CTk):
 
     def _set_area(self):
         self._debug_event("Scan-area selector opened", "info")
+        self._remember_window_placement()
         self.withdraw()
-        self.after(200, lambda: ScanAreaSelector(self, self._area_selected))
+        self.after(200, lambda: ScanAreaSelector(self, self._area_selected, self._area_selection_cancelled))
+
+    def _remember_window_placement(self):
+        try:
+            self.update_idletasks()
+            self._pre_area_window_state = self.state()
+            self._pre_area_window_geometry = self.geometry()
+        except Exception:
+            self._pre_area_window_state = "normal"
+            self._pre_area_window_geometry = None
+
+    def _restore_window_placement(self):
+        self.deiconify()
+        if self._pre_area_window_geometry:
+            try:
+                self.geometry(self._pre_area_window_geometry)
+            except Exception:
+                pass
+        if self._pre_area_window_state in ("normal", "zoomed"):
+            try:
+                self.state(self._pre_area_window_state)
+            except Exception:
+                pass
+        self.lift()
+        self._sync_window_stack()
+
+    def _area_selection_cancelled(self):
+        self._restore_window_placement()
+        self._debug_event("Scan-area selector cancelled", "info")
 
     def _area_selected(self, area: dict):
         self._scan_area = area
-        self.deiconify()
+        self._restore_window_placement()
         info = f"{area['width']} × {area['height']}  at  ({area['left']}, {area['top']})"
         self._area_lbl.configure(text=f"Scan area: {info}", text_color="#4caf50")
         self._set_status("Scan area set")
@@ -1718,7 +1955,6 @@ class ListScannerApp(ctk.CTk):
             {
                 "text": ln,
                 "search_prep": _preprocess_search_term(ln),
-                "is_numeric": _is_numeric_item(ln),
                 "status": "pending",
                 "votes": deque(maxlen=self._WINDOW_SIZE),
                 "last_boxes": [],
@@ -1727,12 +1963,7 @@ class ListScannerApp(ctk.CTk):
             }
             for ln in lines
         ]
-        self._ocr_digits_only = bool(self._items) and all(item["is_numeric"] for item in self._items)
         self._debug_event(f"Parsed {len(self._items)} list item(s)", "info")
-        self._debug_event(
-            f"OCR mode: {'digits-only + English' if self._ocr_digits_only else 'English'}",
-            "info",
-        )
         return True
 
     def _update_row(self, idx: int, status: str):
@@ -1784,7 +2015,7 @@ class ListScannerApp(ctk.CTk):
         self._debug_event(
             f"Scanning started: items={len(self._items)}, area={area['width']}x{area['height']} "
             f"at ({area['left']},{area['top']}), scale={self._ocr_scale:.1f}x, "
-            f"ocr_mode={'digits-only' if self._ocr_digits_only else 'general'}, lang=eng, "
+            f"ocr_mode=general, lang=eng, "
             f"adaptive_tiles=target{self._ocr_tile_target_px}px/min{self._OCR_TILE_MIN_PX}px/"
             f"overlap(x={overlap_x_px}px,y={overlap_y_px}px;base={self._ocr_tile_overlap_px}px,longest_token={longest_token_chars})/max{self._ocr_tile_max}, "
             f"overlay={'on' if self._show_overlay else 'off'}, screenshot_preview="
@@ -1920,10 +2151,11 @@ class ListScannerApp(ctk.CTk):
                     time.sleep(self._SCAN_INTERVAL)
                     continue
 
-                # Convert to grayscale before resizing — 1/3 the pixel data = much faster resize.
-                # Tesseract converts to grayscale internally anyway.
+                # Use the red channel instead of weighted grayscale — orange, amber and
+                # white text all have strong red signal, so this gives higher contrast
+                # against dark backgrounds without slowing anything down.
                 _SCALE = self._ocr_scale
-                gray = orig_img.convert("L")
+                gray, _, _ = orig_img.split()
                 w, h = gray.size
                 img = gray.resize((int(w * _SCALE), int(h * _SCALE)), Image.BILINEAR)
 
@@ -1947,7 +2179,6 @@ class ListScannerApp(ctk.CTk):
                     pass_result = self._ocr_engine.run_pass(
                         gray=gray,
                         scale=_SCALE,
-                        digits_only=self._ocr_digits_only,
                         target_px=self._ocr_tile_target_px,
                         min_tile_px=self._OCR_TILE_MIN_PX,
                         overlap_x_px=overlap_x_px,
